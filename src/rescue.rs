@@ -158,6 +158,14 @@ pub fn run_rescue(
     let mut last_save = Instant::now();
 
     let maybe_save = |map: &mut MapFile, ops: &mut usize, last_save: &mut Instant| -> io::Result<()> {
+        if crate::tui::interrupted() {
+            // Ctrl+C/kill: guardar el mapa y salir; --resume retoma exacto.
+            map.save(map_path)?;
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "rescate interrumpido — mapfile guardado",
+            ));
+        }
         *ops += 1;
         if *ops >= opts.save_every_ops.max(1) || last_save.elapsed().as_secs() >= 60 {
             map.save(map_path)?;
