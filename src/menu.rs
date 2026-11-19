@@ -766,8 +766,13 @@ mod tests {
             resolve_unit("1", &disks),
             Some(Target::Raw(PathBuf::from("/dev/rdisk2")))
         );
-        // Fuera de la lista: se interpreta como número de disco crudo.
-        assert_eq!(resolve_unit("4", &disks), Some(Target::Raw(PathBuf::from("/dev/rdisk4"))));
+        // Fuera de la lista: se interpreta como número de disco crudo, con el
+        // nombre nativo del SO que ejecuta el test (`/dev/rdisk4`, `/dev/sd4`
+        // o `\\.\PhysicalDrive4` según la plataforma).
+        assert_eq!(
+            resolve_unit("4", &disks),
+            Some(Target::Raw(PathBuf::from(RawDisk::native_name(4))))
+        );
         // Ruta explícita e imagen de archivo siguen funcionando.
         assert_eq!(
             resolve_unit("/dev/rdisk9", &disks),

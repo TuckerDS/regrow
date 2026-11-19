@@ -1259,15 +1259,17 @@ mod tests {
         assert_eq!(band_flag(4).char(), 'X');
     }
 
+    // Umbrales y sueño elegidos con margen ancho: en runners compartidos
+    // `thread::sleep` puede pasarse decenas de ms, y el test quedaría flaky.
     #[test]
     fn scan_clasifica_bandas_y_escribe_flags() {
         let mut src = MockSource::new(50);
-        src.slow_ms.insert(10, 10); // T1 → 'T'
-        src.slow_ms.insert(11, 12); // T1 contiguo ⇒ corrida T2
-        src.slow_ms.insert(20, 25); // T2 → 'U'
-        src.slow_ms.insert(30, 60); // T3 → 'V'
-        src.slow_ms.insert(40, 240); // T4 → 'X' (retardo)
-        let opts = banded_opts(RunMode::Scan, 0, 50, [5, 20, 50, 200]);
+        src.slow_ms.insert(10, 15); // T1 → 'T'
+        src.slow_ms.insert(11, 17); // T1 contiguo ⇒ corrida T2
+        src.slow_ms.insert(20, 120); // T2 → 'U'
+        src.slow_ms.insert(30, 250); // T3 → 'V'
+        src.slow_ms.insert(40, 600); // T4 → 'X' (retardo)
+        let opts = banded_opts(RunMode::Scan, 0, 50, [5, 100, 200, 400]);
         let rep = run(&mut src, &opts, hooks_empty(), collect());
         assert_eq!(src.writes.len(), 0, "Scan no escribe");
         assert_eq!(
@@ -1288,13 +1290,13 @@ mod tests {
     #[test]
     fn prescan_clasifica_bandas_de_problemas() {
         let mut src = MockSource::new(300);
-        // Todos los lentos en el primer bloque: su tiempo total (≈318 ms)
-        // supera el retardo (200 ms) ⇒ el bloque se aísla y se mide sector a
-        // sector con bandas.
-        src.slow_ms.insert(3, 60); // T3
-        src.slow_ms.insert(4, 250); // T4
-        src.slow_ms.insert(5, 9); // T1
-        let opts = banded_opts(RunMode::Scan, 0, 300, [5, 20, 50, 200]);
+        // Todos los lentos en el primer bloque: su tiempo total (≈865 ms)
+        // supera el retardo (400 ms) ⇒ el bloque se aísla y se mide sector a
+        // sector con bandas (margen ancho, ver nota del test anterior).
+        src.slow_ms.insert(3, 250); // T3
+        src.slow_ms.insert(4, 600); // T4
+        src.slow_ms.insert(5, 15); // T1
+        let opts = banded_opts(RunMode::Scan, 0, 300, [5, 100, 200, 400]);
         let rep = prescan(&mut src, &opts, &mut hooks_empty(), collect());
         assert_eq!(
             rep.problems,
@@ -1314,10 +1316,10 @@ mod tests {
     #[test]
     fn refresh_reescribe_lentos_preservando_contenido() {
         let mut src = MockSource::new(40);
-        src.slow_ms.insert(10, 10); // T1: Repair no la toca; Refresh sí
-        src.slow_ms.insert(20, 250); // T4
+        src.slow_ms.insert(10, 15); // T1: Repair no la toca; Refresh sí
+        src.slow_ms.insert(20, 600); // T4
         src.degraded.insert(30); // ilegible hasta escribir
-        let opts = banded_opts(RunMode::Refresh, 0, 40, [5, 20, 50, 200]);
+        let opts = banded_opts(RunMode::Refresh, 0, 40, [5, 100, 200, 400]);
         let rep = run(&mut src, &opts, hooks_empty(), collect());
         assert_eq!(src.writes, vec![10, 20], "sin permiso no se escribe sobre ilegibles");
         assert_eq!(rep.stats.recovered, 2);
@@ -1337,9 +1339,9 @@ mod tests {
     #[test]
     fn repair_no_refresca_bandas_bajas() {
         let mut src = MockSource::new(40);
-        src.slow_ms.insert(10, 10); // T1
-        src.slow_ms.insert(20, 250); // T4
-        let opts = banded_opts(RunMode::Repair, 0, 40, [5, 20, 50, 200]);
+        src.slow_ms.insert(10, 15); // T1
+        src.slow_ms.insert(20, 600); // T4
+        let opts = banded_opts(RunMode::Repair, 0, 40, [5, 100, 200, 400]);
         let rep = run(&mut src, &opts, hooks_empty(), collect());
         assert_eq!(src.writes, vec![20], "solo la banda T4 se reescribe");
         assert_eq!(rep.stats.recovered, 1);
