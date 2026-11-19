@@ -1,0 +1,27 @@
+# Matriz 3 SO: build + tests en macOS/Linux/Windows.
+# Nota: los tests marcados #[ignore] (acceso crudo real) no corren aquí;
+# los de SMART usan fixtures sintéticas. Linux musl estático queda diferido.
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests
+        run: cargo test --bin regrow
+      - name: Build release
+        run: cargo build --release
+      # En macOS/Windows se comprueba además el cruce sin compilar enlazado:
+      - name: Cross-check
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo check --target x86_64-unknown-linux-gnu

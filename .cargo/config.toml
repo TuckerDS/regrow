@@ -1,0 +1,4 @@
+# Todo lo que compile cargo va a repository/build/ (los binarios finales se
+# organizan por target: build/<triple>/release/...).
+[build]
+target-dir = "build"

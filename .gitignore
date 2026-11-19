@@ -1,0 +1,17 @@
+# Compilaciones y artefactos — no se versionan
+/build/*
+!/build/.gitkeep
+
+# Cargo (target por defecto; el target real apunta a build/ vía .cargo/config.toml)
+/target/
+
+# Datos producidos al ejecutar el programa desde el repo
+/diskstats/
+/backup/
+
+# Binarios sueltos
+*.o
+*.d
+
+# SO
+.DS_Store
