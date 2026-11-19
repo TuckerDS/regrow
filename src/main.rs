@@ -24,11 +24,14 @@ mod backup;
 mod config;
 mod engine;
 mod log;
+mod mapfile;
 mod menu;
+mod rescue;
 mod smart;
 mod source;
 mod speed;
 mod state;
+mod surfmap;
 mod tui;
 
 use std::fs;
@@ -72,6 +75,17 @@ pub struct CommonOpts {
     pub resume: bool,  // retomar desde DISKn.state
     pub max_temp: Option<u64>, // umbral °C para el monitor SMART
     pub ssd_wear_ok: bool,     // desbloquea regenerate en SSD 
+    // Rescate (rescue): la ruta posicional pasa a ser la IMAGEN DESTINO.
+    pub block: usize,                // sectores por bloque de la fase directa
+    pub retries: u8,                 // tentativas por sector en el rascado
+    pub reverse: bool,               // pasada inversa (activa por defecto)
+    pub map_path: Option<PathBuf>,   // mapfile propio (def: <imagen-destino>.map)
+    pub export_map: Option<PathBuf>, // exportar además el mapa en texto
+    pub import_map: Option<PathBuf>, // continuar desde un mapfile de texto ajeno
+    // Mapa de superficie (surfmap):
+    pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
+    pub cells: usize,         // resolución del mapa (def 1024)
+    pub out_path: Option<PathBuf>,
 }
 
 fn usage() -> ! {
@@ -80,6 +94,9 @@ fn usage() -> ! {
          \x20 regrow <…> --raw N [opciones]\n\
          \x20 regrow <…> --dev PATH [opciones]\n\
          \x20 regrow smart --raw N | --dev PATH\n\
+         \x20 regrow selftest <status|short|long|conveyance|abort> --raw N | --dev PATH\n\
+         \x20 regrow rescue <imagen-destino> --raw N | --dev PATH [opciones]\n\
+         \x20 regrow surfmap --id N [--log-dir D] [--sectors N] [--cells N] [--out F]\n\
          \x20 regrow menu [imagen|--raw N|--dev PATH] [opciones]\n\
          \x20 --start N          primer sector (def 0)\n\
          \x20 --end N            último sector exclusivo (def: total)\n\
@@ -101,6 +118,16 @@ fn usage() -> ! {
          \x20 --max-temp C       pausar la pasada si el disco supera C °C (usa smartctl)\n\
          \x20 --ssd-wear-ok      permitir regenerate sobre medio sólido (SSD/NVMe):\n\
          \x20                    reescribir páginas sanas desgasta la NAND sin beneficio\n\
+         \x20 --block N          (rescue) sectores por bloque de la fase directa (def 128 = 64 KiB)\n\
+         \x20 --retry N          (rescue) tentativas por sector fallido en el rascado (def 3)\n\
+         \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
+         \x20 --map F            (rescue) mapfile propio (def: <imagen-destino>.map)\n\
+         \x20 --export-map F     (rescue) exportar además el mapa en texto compatible\n\
+         \x20 --import-map F     (rescue) continuar desde un mapfile de texto ajeno\n\
+         \x20                    (rescue: la ruta posicional es la IMAGEN DESTINO sparse;\n\
+         \x20                    el origen es SIEMPRE --raw/--dev; --resume retoma no linealmente)\n\
+         \x20 --sectors N        (surfmap) dominio del mapa; si falta, se toma del DISKn.state\n\
+         \x20 --cells N          (surfmap) resolución 16..8192 (def 1024)\n\
          \x20 --raw N            unidad crudo nativa (root/admin requerido)\n\
          \x20 --dev PATH         ruta explícita de dispositivo crudo\n\
          \x20 --version          versión y licencia\n\
@@ -190,6 +217,15 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         resume: false,
         max_temp: None,
         ssd_wear_ok: false,
+        block: rescue::RESCUE_BLOCK_DEFAULT,
+        retries: rescue::RESCUE_RETRIES_DEFAULT,
+        reverse: true,
+        map_path: None,
+        export_map: None,
+        import_map: None,
+        sectors: None,
+        cells: surfmap::SURFMAP_DEFAULT_CELLS,
+        out_path: None,
     };
     let mut i = 0;
     let mut delay_given = false;
@@ -221,6 +257,15 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--prescan" => o.prescan = true,
             "--resume" => o.resume = true,
             "--ssd-wear-ok" => o.ssd_wear_ok = true,
+            "--block" => o.block = take_num(args, &mut i, "--block").clamp(1, 65536) as usize,
+            "--retry" => o.retries = take_num(args, &mut i, "--retry").clamp(1, 255) as u8,
+            "--no-reverse" => o.reverse = false,
+            "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
+            "--export-map" => o.export_map = Some(take_path(args, &mut i, "--export-map")),
+            "--import-map" => o.import_map = Some(take_path(args, &mut i, "--import-map")),
+            "--sectors" => o.sectors = Some(take_num(args, &mut i, "--sectors")),
+            "--cells" => o.cells = take_num(args, &mut i, "--cells").clamp(16, 8192) as usize,
+            "--out" => o.out_path = Some(take_path(args, &mut i, "--out")),
             other => {
                 eprintln!("error: opción desconocida {other}");
                 usage();
@@ -333,6 +378,9 @@ pub fn main() -> ExitCode {
         }
         "menu" => menu::run(&parse_common(&args[1..])),
         "smart" => cli_smart(&args[1..]),
+        "selftest" => cli_selftest(&args[1..]),
+        "rescue" => cli_rescue(&parse_common(&args[1..])),
+        "surfmap" => cli_surfmap(&parse_common(&args[1..])),
         "prescan" => cli_prescan(&parse_common(&args[1..])),
         "speedtest" => cli_speedtest(&parse_common(&args[1..])),
         "scan" => cli_pass(&parse_common(&args[1..]), RunMode::Scan),
@@ -361,6 +409,235 @@ fn cli_smart(args: &[String]) -> ExitCode {
         Err(e) => eprintln!("error consultando SMART de {}: {e}", dev.display()),
     }
     ExitCode::SUCCESS
+}
+
+fn cli_selftest(args: &[String]) -> ExitCode {
+    let (action, rest): (String, Vec<String>) = match args.first().map(|s| s.as_str()) {
+        Some(a @ ("status" | "short" | "long" | "conveyance" | "abort")) => (a.to_string(), args[1..].to_vec()),
+        _ => ("status".to_string(), args.to_vec()),
+    };
+    let o = parse_common(&rest);
+    let Some(dev) = o
+        .raw
+        .map(|n| PathBuf::from(RawDisk::native_name(n)))
+        .or_else(|| o.dev.clone())
+    else {
+        eprintln!("error: selftest requiere un dispositivo (--raw N | --dev PATH), no una imagen");
+        return ExitCode::from(2);
+    };
+    if !smart::smart_available() {
+        eprintln!("error: selftest requiere `smartctl` (paquete smartmontools)");
+        return ExitCode::from(1);
+    }
+    match action.as_str() {
+        "status" => match smart::selftest_log(&dev) {
+            Ok(entries) => smart::print_selftests(&entries, &dev.display().to_string()),
+            Err(e) => {
+                eprintln!("error consultando el registro de self-tests: {e}{}", perm_note(&e));
+                return ExitCode::from(1);
+            }
+        },
+        "abort" => match smart::selftest_abort(&dev) {
+            Ok(true) => println!("self-test abortado en {}", dev.display()),
+            Ok(false) => {
+                println!("smartctl rechazó el abort (¿no hay ninguna prueba en curso?)");
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("error abortando el self-test: {e}{}", perm_note(&e));
+                return ExitCode::from(1);
+            }
+        },
+        kind => match smart::selftest_start(&dev, kind) {
+            Ok((true, text)) => {
+                println!("self-test {kind} iniciado en {}", dev.display());
+                for l in text.lines().filter(|l| l.contains("Estimated") || l.contains("Duration")).take(2) {
+                    println!("  {l}");
+                }
+                println!("  la unidad lo ejecuta sola: no la muevas ni la duermas.");
+                println!("  progreso: regrow selftest status --dev {}", dev.display());
+            }
+            Ok((false, text)) => {
+                eprintln!("no se pudo iniciar el self-test {kind}:");
+                for l in text.lines().take(4) {
+                    eprintln!("  {l}");
+                }
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("error iniciando el self-test: {e}{}", perm_note(&e));
+                return ExitCode::from(1);
+            }
+        },
+    }
+    ExitCode::SUCCESS
+}
+
+fn cli_rescue(o: &CommonOpts) -> ExitCode {
+    if o.raw.is_none() && o.dev.is_none() {
+        eprintln!("error: rescue necesita un origen crudo (--raw N | --dev PATH); la ruta posicional es la imagen DESTINO");
+        return ExitCode::from(2);
+    }
+    let Some(dest) = o.image.clone() else {
+        eprintln!("error: rescue necesita la imagen destino (ruta posicional antes de las opciones)");
+        return ExitCode::from(2);
+    };
+    let (display, _dev, mut src) = match open_target(o, false) {
+        Ok(v) => v,
+        Err((msg, code)) => {
+            eprintln!("{msg}");
+            return code;
+        }
+    };
+    let total = src.sector_count();
+    let total32 = total.min(u32::MAX as u64) as u32;
+    let end = o.end.unwrap_or(total32).min(total32);
+    if o.start >= end {
+        eprintln!("error: rango vacío (start={} end={end}, total={total})", o.start);
+        return ExitCode::from(1);
+    }
+
+    let mut img = match rescue::prepare_image(&dest, total) {
+        Ok(im) => im,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let map_path = o.map_path.clone().unwrap_or_else(|| {
+        let mut s = dest.to_string_lossy().into_owned();
+        s.push_str(".map");
+        PathBuf::from(s)
+    });
+    let mut map = if let Some(imp) = &o.import_map {
+        match mapfile::MapFile::import_text(imp, total) {
+            Ok(m) => {
+                let (g, _, _, _) = m.stats();
+                println!("mapa ajeno importado desde {}: {} sectores ya buenos NO se releerán", imp.display(), g);
+                m
+            }
+            Err(e) => {
+                eprintln!("error importando el mapfile: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if map_path.exists() {
+        if o.resume {
+            match mapfile::MapFile::load(&map_path) {
+                Ok(m) => {
+                    if m.sector_count != total {
+                        eprintln!(
+                            "error: el mapfile es de un dominio de {} sectores y el origen tiene {total}",
+                            m.sector_count
+                        );
+                        return ExitCode::from(1);
+                    }
+                    let (g, _, _, _) = m.stats();
+                    println!("reanudando desde {}: {} sectores buenos preservados", map_path.display(), g);
+                    m
+                }
+                Err(e) => {
+                    eprintln!("error leyendo el mapfile: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            eprintln!(
+                "aviso: existe un mapfile en {}; IGNORADO (añade --resume para continuarlo). Al terminar será sobrescrito.",
+                map_path.display()
+            );
+            mapfile::MapFile::new(total)
+        }
+    } else {
+        mapfile::MapFile::new(total)
+    };
+
+    println!(
+        "{display}: {total} sectores; rescate [{}..{end}) → {} (mapfile {})",
+        o.start,
+        dest.display(),
+        map_path.display()
+    );
+    let ropts = rescue::RescueOptions {
+        start: o.start as u64,
+        end: end as u64,
+        block: o.block.max(1),
+        retries: o.retries.max(1),
+        reverse: o.reverse,
+        save_every_ops: rescue::RESCUE_SAVE_EVERY_OPS,
+    };
+    let t0 = Instant::now();
+    let mut last_line = Instant::now();
+    let rep = match rescue::run_rescue(&mut *src, &mut img, &mut map, &ropts, &map_path, |p: &rescue::Progress| {
+        if last_line.elapsed().as_secs() >= 30 {
+            last_line = Instant::now();
+            println!(
+                "── [{}] sector {} · buenos {} pendientes {} · bloques {}/{} ok-err · {}",
+                p.phase.label(),
+                p.cur,
+                p.good,
+                p.pending,
+                p.blocks_ok,
+                p.block_errors,
+                format_hms(t0.elapsed().as_secs())
+            );
+        }
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error durante el rescate: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(x) = &o.export_map {
+        match map.export_text(x) {
+            Ok(()) => println!("mapa de texto exportado a {}", x.display()),
+            Err(e) => eprintln!("aviso: no se pudo exportar el mapa de texto: {e}"),
+        }
+    }
+    println!("rescate terminado en {}", format_hms(rep.seconds));
+    println!(
+        "  buenos: {}  fallidos (se reintentan con --resume): {}  rascados: {}  sin mapear: {}",
+        rep.good, rep.failed, rep.scraped, rep.untried
+    );
+    if rep.failed + rep.scraped + rep.untried > 0 {
+        println!(
+            "  quedan pendientes: repite con --resume (origen y destino idénticos; mapa {})",
+            map_path.display()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn cli_surfmap(o: &CommonOpts) -> ExitCode {
+    let total = match o.sectors {
+        Some(t) => t,
+        None => match load_pending(&o.log_dir, o.id) {
+            Ok(Some(cp)) => cp.end as u64,
+            Ok(None) => {
+                eprintln!(
+                    "error: falta --sectors N y no hay checkpoint DISK{}.state del que tomar el rango",
+                    o.id
+                );
+                return ExitCode::from(2);
+            }
+            Err(e) => {
+                eprintln!("error leyendo el checkpoint: {e}");
+                return ExitCode::from(1);
+            }
+        },
+    };
+    match surfmap::write_surfmap(&o.log_dir, o.id, total, o.cells, o.out_path.as_deref()) {
+        Ok(p) => {
+            println!("mapa de superficie escrito en {} (ábrelo en el navegador)", p.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn cli_prescan(o: &CommonOpts) -> ExitCode {
@@ -940,6 +1217,10 @@ pub(crate) fn process_run(
         // bloque, antes del resumen (bug escalera 2026-11-19).
         let _raw = if live { tui::RawGuard::new() } else { None };
         let mut last_bar = String::new();
+        // Sin tty (nohup, pipe, log): cada ~30 s se emite una LÍNEA de estado
+        // legible con `tail -f` — sector exacto, %, contadores por banda,
+        // tiempo y ETA. En tty no hace falta: el panel vivo ya lo pinta.
+        let mut last_status = Instant::now();
         let mut progress = |sector: u32, stats: &EngineStats| {
             let cp = Checkpoint {
                 mode,
@@ -953,6 +1234,28 @@ pub(crate) fn process_run(
             };
             if let Err(e) = cp.save(&sp) {
                 eprintln!("aviso: no se pudo guardar el checkpoint: {e}");
+            }
+            if !live && last_status.elapsed().as_secs() >= 30 {
+                last_status = Instant::now();
+                let range = (end - start) as u64;
+                let done = (sector - start) as u64;
+                let el = t_start.elapsed().as_secs().max(1);
+                let pct = 100.0 * done as f64 / range.max(1) as f64;
+                let eta = if done > 0 {
+                    format_hms((range - done) * el / done)
+                } else {
+                    "?".to_string()
+                };
+                println!(
+                    "── sector {sector} ({pct:.2} %) · T{} U{} V{} X{} · ilegibles {} · {:.1} MB · transcurrido {} · ETA ~{eta}",
+                    stats.slow1,
+                    stats.slow2,
+                    stats.slow3,
+                    stats.delays,
+                    stats.bad,
+                    done as f64 * 512.0 / 1e6,
+                    format_hms(el)
+                );
             }
         };
         // Hook ui (panel vivo): sondea ESC (poll(0)) y reescribe las filas.
@@ -1114,6 +1417,15 @@ mod tests {
             resume: false,
             max_temp: None,
             ssd_wear_ok: false,
+            block: rescue::RESCUE_BLOCK_DEFAULT,
+            retries: rescue::RESCUE_RETRIES_DEFAULT,
+            reverse: true,
+            map_path: None,
+            export_map: None,
+            import_map: None,
+            sectors: None,
+            cells: surfmap::SURFMAP_DEFAULT_CELLS,
+            out_path: None,
         }
     }
 
