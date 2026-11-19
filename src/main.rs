@@ -78,6 +78,7 @@ pub struct CommonOpts {
     // Rescate (rescue): la ruta posicional pasa a ser la IMAGEN DESTINO.
     pub block: usize,                // sectores por bloque de la fase directa
     pub retries: u8,                 // tentativas por sector en el rascado
+    pub retry_wait: u64,             // segundos de descanso entre reintentos/bloque fallido
     pub reverse: bool,               // pasada inversa (activa por defecto)
     pub map_path: Option<PathBuf>,   // mapfile propio (def: <imagen-destino>.map)
     pub export_map: Option<PathBuf>, // exportar además el mapa en texto
@@ -115,11 +116,14 @@ fn usage() -> ! {
          \x20 --prescan          barrido bulk previo dentro de scan/repair\n\
          \x20 --resume           retomar la pasada interrumpida desde DISKn.state\n\
          \x20                    (en el menú se ofrece solo si la unidad tiene una)\n\
-         \x20 --max-temp C       pausar la pasada si el disco supera C °C (usa smartctl)\n\
+         \x20 --max-temp C       pausar la pasada (scan/repair/refresh/rescue) si el disco\n\
+         \x20                    supera C °C (usa smartctl)\n\
          \x20 --ssd-wear-ok      permitir regenerate sobre medio sólido (SSD/NVMe):\n\
          \x20                    reescribir páginas sanas desgasta la NAND sin beneficio\n\
          \x20 --block N          (rescue) sectores por bloque de la fase directa (def 128 = 64 KiB)\n\
          \x20 --retry N          (rescue) tentativas por sector fallido en el rascado (def 3)\n\
+         \x20 --retry-wait S     (rescue) segundos de descanso entre reintentos y tras bloque\n\
+         \x20                    fallido (def 2; 0 = sin pausas) — en campo: más pausa, menos daño\n\
          \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
          \x20 --map F            (rescue) mapfile propio (def: <imagen-destino>.map)\n\
          \x20 --export-map F     (rescue) exportar además el mapa en texto compatible\n\
@@ -219,6 +223,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         ssd_wear_ok: false,
         block: rescue::RESCUE_BLOCK_DEFAULT,
         retries: rescue::RESCUE_RETRIES_DEFAULT,
+        retry_wait: 2,
         reverse: true,
         map_path: None,
         export_map: None,
@@ -259,6 +264,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--ssd-wear-ok" => o.ssd_wear_ok = true,
             "--block" => o.block = take_num(args, &mut i, "--block").clamp(1, 65536) as usize,
             "--retry" => o.retries = take_num(args, &mut i, "--retry").clamp(1, 255) as u8,
+            "--retry-wait" => o.retry_wait = take_num(args, &mut i, "--retry-wait").clamp(0, 3600),
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
             "--export-map" => o.export_map = Some(take_path(args, &mut i, "--export-map")),
@@ -485,7 +491,7 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         eprintln!("error: rescue necesita la imagen destino (ruta posicional antes de las opciones)");
         return ExitCode::from(2);
     };
-    let (display, _dev, mut src) = match open_target(o, false) {
+    let (display, dev, mut src) = match open_target(o, false) {
         Ok(v) => v,
         Err((msg, code)) => {
             eprintln!("{msg}");
@@ -569,6 +575,9 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         retries: o.retries.max(1),
         reverse: o.reverse,
         save_every_ops: rescue::RESCUE_SAVE_EVERY_OPS,
+        retry_wait: Duration::from_secs(o.retry_wait),
+        max_temp: o.max_temp,
+        device: dev.clone(),
     };
     let t0 = Instant::now();
     let mut last_line = Instant::now();
@@ -1444,6 +1453,7 @@ mod tests {
             ssd_wear_ok: false,
             block: rescue::RESCUE_BLOCK_DEFAULT,
             retries: rescue::RESCUE_RETRIES_DEFAULT,
+            retry_wait: 2,
             reverse: true,
             map_path: None,
             export_map: None,

@@ -713,6 +713,7 @@ mod tests {
             ssd_wear_ok: false,
             block: crate::rescue::RESCUE_BLOCK_DEFAULT,
             retries: crate::rescue::RESCUE_RETRIES_DEFAULT,
+            retry_wait: 2,
             reverse: true,
             map_path: None,
             export_map: None,
