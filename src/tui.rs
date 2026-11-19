@@ -55,6 +55,9 @@ mod ffi {
         pub fn poll(fds: *mut PollFd, nfds: c_int, timeout: c_int) -> c_int;
         pub fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
         pub fn ioctl(fd: c_int, request: u64, ...) -> c_int;
+        pub fn signal(sig: c_int, disp: Option<extern "C" fn(c_int)>) -> Option<extern "C" fn(c_int)>;
+        pub fn kill(pid: c_int, sig: c_int) -> c_int;
+        pub fn getpid() -> c_int;
     }
 }
 
@@ -163,7 +166,52 @@ mod ffi {
         pub fn GetStdHandle(which: c_int) -> *mut core::ffi::c_void;
         pub fn GetConsoleMode(handle: *mut core::ffi::c_void, mode: *mut u32) -> i32;
         pub fn SetConsoleMode(handle: *mut core::ffi::c_void, mode: u32) -> i32;
+        pub fn signal(sig: c_int, disp: Option<extern "C" fn(c_int)>) -> Option<extern "C" fn(c_int)>;
     }
+}
+
+// ------------------------------------------------------------- interrupción --
+// Sin esta capa, Ctrl+C o `kill` en una pasada de campo (nohup, sin tty) MATAN
+// el proceso por defecto: se pierde el registro parcial y el checkpoint se
+// queda obsoleto (hasta un poll entero). El handler solo fija una bandera
+// (async-signal-safe: un AtomicBool lock-free); el motor la comprueba en cada
+// tick y aborta el pase LIMPIO — registro parcial + checkpoint exacto,
+// reanudable con --resume. En el panel vivo raw, cfmakeraw apaga ISIG: allí
+// la tecla de abortar sigue siendo ESC (Ctrl+C llega como byte 0x03 inofensivo).
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: std::os::raw::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// Instala el handler de interrupción (SIGINT=2 y SIGTERM=15 en unix; SIGINT
+/// en la consola de Windows). Seguro llamarlo varias veces.
+pub fn install_signals() {
+    #[cfg(any(unix, windows))]
+    unsafe {
+        #[cfg(unix)]
+        const SIGINT: std::os::raw::c_int = 2;
+        #[cfg(unix)]
+        const SIGTERM: std::os::raw::c_int = 15;
+        #[cfg(windows)]
+        const SIGINT: std::os::raw::c_int = 2;
+        ffi::signal(SIGINT, Some(on_signal));
+        #[cfg(unix)]
+        ffi::signal(SIGTERM, Some(on_signal));
+    }
+}
+
+/// ¿Se pidió abortar (Ctrl+C / kill)? El motor lo traduce en pase abortado.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Limpia la bandera al empezar cada pasada (en el menú, un Ctrl+C en una
+/// pasada no debe abortar las siguientes).
+pub fn clear_interrupted() {
+    INTERRUPTED.store(false, Ordering::SeqCst);
 }
 
 /// ¿stdin y stdout son terminal? (los tests con Cursor devuelven false y la
@@ -451,4 +499,32 @@ pub fn wrap_text(text: &str, cols: usize) -> String {
         lines.push(cur);
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    /// Señal REAL (SIGINT al propio proceso) → bandera de interrupción.
+    /// Prueba el camino completo: `signal()` FFI + handler async-safe +
+    /// lectura atómica. Solo unix (donde existe `kill`).
+    #[test]
+    #[cfg(unix)]
+    fn sigint_real_activa_la_bandera() {
+        use super::{clear_interrupted, install_signals, interrupted};
+        install_signals();
+        clear_interrupted();
+        unsafe {
+            super::ffi::kill(super::ffi::getpid(), 2); // SIGINT
+        }
+        // La entrega de la señal ocurre al volver de la syscall siguiente;
+        // el spin_loop mantiene el hilo vivo hasta entonces (sin dormir).
+        for _ in 0..5_000_000 {
+            if interrupted() {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        assert!(interrupted(), "SIGINT no activó la bandera");
+        clear_interrupted();
+        assert!(!interrupted());
+    }
 }

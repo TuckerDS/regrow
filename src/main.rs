@@ -367,6 +367,9 @@ fn resolve_range(src: &dyn SectorSource, o: &CommonOpts) -> Result<(u32, u32), E
 }
 
 pub fn main() -> ExitCode {
+    // Ctrl+C / kill abortan la pasada de forma limpia (registro parcial +
+    // checkpoint), no matan el proceso dejando el progreso obsoleto.
+    tui::install_signals();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         usage();
@@ -1062,6 +1065,9 @@ pub(crate) fn process_run(
     mode: RunMode,
     prev: Option<&Checkpoint>,
 ) -> ExitCode {
+    // Una interrupción pendiente de una pasada anterior (menú) no debe
+    // abortar esta.
+    tui::clear_interrupted();
     let mut opts = EngineOptions::new(mode, start, end);
     opts.delay = Duration::from_millis(o.delay_ms);
     opts.bands = o.bands;
@@ -1235,6 +1241,25 @@ pub(crate) fn process_run(
             if let Err(e) = cp.save(&sp) {
                 eprintln!("aviso: no se pudo guardar el checkpoint: {e}");
             }
+        };
+        // Hook ui: sondea interrupciones (ESC en el panel vivo; bandera SIGINT/
+        // SIGTERM en cualquier modo) y reescribe las filas. Su `false` aborta
+        // el pase; la llamada final de `progress` deja el checkpoint en el
+        // sector exacto de la pausa (--resume). Sin tty además emite aquí la
+        // línea de estado de los ~30 s: el hook vive cada tick del motor, así
+        // que la línea fluye incluso cuando el disco va lentísimo en un clúster
+        // malo (con `progress` se secaría: solo va por polls de 8192 sectores).
+        let mut ui = |cells: &[Cell; GRID_CELLS], stats: &EngineStats, sector: u32| -> bool {
+            if tui::interrupted() {
+                return false;
+            }
+            if live {
+                if let Some(k) = tui::poll_key(0) {
+                    if k == tui::ESC {
+                        return false;
+                    }
+                }
+            }
             if !live && last_status.elapsed().as_secs() >= 30 {
                 last_status = Instant::now();
                 let range = (end - start) as u64;
@@ -1257,33 +1282,27 @@ pub(crate) fn process_run(
                     format_hms(el)
                 );
             }
-        };
-        // Hook ui (panel vivo): sondea ESC (poll(0)) y reescribe las filas.
-        // Su `false` aborta el pase; la llamada final de `progress` deja el
-        // checkpoint en el sector exacto de la pausa (--resume).
-        let mut ui = |cells: &[Cell; GRID_CELLS], stats: &EngineStats, _sector: u32| -> bool {
-            if let Some(k) = tui::poll_key(0) {
-                if k == tui::ESC {
-                    return false;
-                }
+            if live {
+                let rows = live_rows(
+                    mode,
+                    cells,
+                    stats,
+                    (end - start) as u64,
+                    t_start.elapsed().as_secs(),
+                    &paint,
+                );
+                let n = rows.len();
+                paint.rows(n, &rows);
             }
-            let rows = live_rows(
-                mode,
-                cells,
-                stats,
-                (end - start) as u64,
-                t_start.elapsed().as_secs(),
-                &paint,
-            );
-            let n = rows.len();
-            paint.rows(n, &rows);
             true
         };
         let hooks = RunHooks {
             backup: backup.as_mut().map(|b| b as &mut dyn SectorBackup),
             monitor: guard.as_mut().map(|g| g as &mut dyn engine::HealthMonitor),
             progress: Some(&mut progress),
-            ui: if live { Some(&mut ui) } else { None },
+            // El hook vive SIEMPRE: aporta la comprobación de interrupción
+            // (Ctrl+C/kill limpios sin tty) y la línea de estado degradada.
+            ui: Some(&mut ui),
         };
         report = run(src, &opts, hooks, |cells: &[Cell; GRID_CELLS]| {
             if live {
