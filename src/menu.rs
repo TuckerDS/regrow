@@ -711,6 +711,15 @@ mod tests {
             resume: false,
             max_temp: None,
             ssd_wear_ok: false,
+            block: crate::rescue::RESCUE_BLOCK_DEFAULT,
+            retries: crate::rescue::RESCUE_RETRIES_DEFAULT,
+            reverse: true,
+            map_path: None,
+            export_map: None,
+            import_map: None,
+            sectors: None,
+            cells: crate::surfmap::SURFMAP_DEFAULT_CELLS,
+            out_path: None,
         }
     }
 

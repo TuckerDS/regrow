@@ -88,6 +88,7 @@ pub trait SectorSource {
 }
 
 /// Backend de imagen de archivo (lectura+escritura sobre un .raw).
+#[derive(Debug)]
 pub struct FileImage {
     file: File,
     sectors: u64,
@@ -111,6 +112,28 @@ impl FileImage {
             file,
             sectors: len / SECTOR_SIZE as u64,
         })
+    }
+
+    /// Crea (o ajusta a `sectors`) una imagen sparse lista para el rescate:
+    /// los sectores que nunca se lean bien quedan como huecos sin espacio.
+    pub fn create(path: &Path, sectors: u64) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        file.set_len(sectors * SECTOR_SIZE as u64)?;
+        Ok(Self { file, sectors })
+    }
+
+    /// Escritura bulk de `count` sectores contiguos (usada por el rescate).
+    pub fn write_chunk(&mut self, lba: u64, count: usize, buf: &[u8]) -> io::Result<()> {
+        self.check(lba)?;
+        let need = count * SECTOR_SIZE;
+        if lba + count as u64 > self.sectors || buf.len() < need {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk fuera de la imagen",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
+        self.file.write_all(&buf[..need])
     }
 
     fn check(&self, lba: u64) -> io::Result<()> {

@@ -338,6 +338,158 @@ impl HealthMonitor for TemperatureGuard {
     }
 }
 
+// ---------------------------------------------------------------- self-tests --
+// Self-tests de la propia unidad vía smartctl: `-t short|long|conveyance`
+// los arranca (la unidad los ejecuta sola y el comando vuelve al instante),
+// `-X` los aborta, `-l selftest` lee el registro con el progreso restante.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelfTestEntry {
+    pub num: u32,
+    pub desc: String,
+    pub status: String,
+    pub remaining_pct: Option<u8>,
+    pub lifetime_h: Option<u64>,
+    pub first_error_lba: Option<u64>,
+}
+
+fn run_smartctl_args(args: &[&str], path: &Path) -> std::io::Result<(Option<i32>, String)> {
+    let mut cmd = Command::new("smartctl");
+    for a in args {
+        cmd.arg(a);
+    }
+    let mut child = cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut out = Vec::new();
+    if let Some(so) = child.stdout.take() {
+        let _ = so.take(256 * 1024).read_to_end(&mut out);
+    }
+    let mut err = Vec::new();
+    if let Some(se) = child.stderr.take() {
+        let _ = se.take(64 * 1024).read_to_end(&mut err);
+    }
+    let code = child.wait().map(|s| s.code()).ok().flatten();
+    let mut text = String::from_utf8_lossy(&out).into_owned();
+    let e = String::from_utf8_lossy(&err);
+    if !e.trim().is_empty() {
+        text.push_str(&e);
+    }
+    Ok((code, text))
+}
+
+/// Parsea la tabla `smartctl -l selftest` (formato ATA: las filas empiezan
+/// por `# n`). Tolerante con filas sin columna `remaining` (algunos NVMe).
+pub fn parse_selftest_log(text: &str) -> Vec<SelfTestEntry> {
+    const STATUS_WORDS: [&str; 6] = [
+        "Completed",
+        "Aborted",
+        "Failed",
+        "Interrupted",
+        "Skipped",
+        "Unknown",
+    ];
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t.len() < 5 || t[0] != "#" {
+            continue;
+        }
+        let Ok(num) = t[1].parse::<u32>() else { continue };
+        let Some(p) = (2..t.len()).find(|&i| STATUS_WORDS.iter().any(|w| t[i].starts_with(w))) else {
+            continue;
+        };
+        let desc = t[2..p].join(" ");
+        // `remaining` es el token acabado en '%', si existe.
+        let rem_idx = (p + 1..t.len()).find(|&i| t[i].ends_with('%'));
+        let (status, remaining_pct, lifetime_h, first_error_lba) = if let Some(q) = rem_idx {
+            let status = t[p..q].join(" ");
+            let pct = t[q].trim_end_matches('%').parse::<u8>().ok();
+            let life = t.get(q + 1).and_then(|v| v.parse::<u64>().ok());
+            let lba = t
+                .get(q + 2)
+                .filter(|v| **v != "-")
+                .and_then(|v| v.parse::<u64>().ok());
+            (status, pct, life, lba)
+        } else {
+            let status = t[p..t.len() - 2].join(" ");
+            let life = t.get(t.len() - 2).and_then(|v| v.parse::<u64>().ok());
+            let lba = t
+                .last()
+                .filter(|v| **v != "-")
+                .and_then(|v| v.parse::<u64>().ok());
+            (status, None, life, lba)
+        };
+        out.push(SelfTestEntry {
+            num,
+            desc,
+            status,
+            remaining_pct,
+            lifetime_h,
+            first_error_lba,
+        });
+    }
+    out
+}
+
+pub fn selftest_log(dev: &Path) -> std::io::Result<Vec<SelfTestEntry>> {
+    let (_, text) = run_smartctl_args(&["-l", "selftest"], dev)?;
+    Ok(parse_selftest_log(&text))
+}
+
+/// Arranca un self-test de la unidad (`short`, `long` o `conveyance`).
+/// Devuelve (iniciado, salida_humana). La prueba corre en el disco: el
+/// progreso se consulta después con `selftest status`.
+pub fn selftest_start(dev: &Path, kind: &str) -> std::io::Result<(bool, String)> {
+    let (code, text) = run_smartctl_args(&["-t", kind], dev)?;
+    // smartctl usa códigos de salida de bits; 0 y 4 indican que la orden
+    // llegó a la unidad (4 = SMART global en fallo, la prueba se lanza igual).
+    let started = matches!(code, Some(0) | Some(4)) && !text.contains("not supported");
+    Ok((started, text))
+}
+
+pub fn selftest_abort(dev: &Path) -> std::io::Result<bool> {
+    let (code, _) = run_smartctl_args(&["-X"], dev)?;
+    Ok(code == Some(0))
+}
+
+/// Imprime el registro de self-tests con lectura humana del último.
+pub fn print_selftests(entries: &[SelfTestEntry], device: &str) {
+    if entries.is_empty() {
+        println!("{device}: sin self-tests registrados (arranca uno con `regrow selftest short|long`)");
+        return;
+    }
+    println!("{device}: registro de self-tests (más reciente primero)");
+    for e in entries {
+        let rem = e
+            .remaining_pct
+            .map(|p| format!(" {p}% restante"))
+            .unwrap_or_default();
+        let lba = e
+            .first_error_lba
+            .map(|l| format!("  primer error en sector {l}"))
+            .unwrap_or_default();
+        println!(
+            "  #{}  {} — {}{}  (horas de vida: {}){}",
+            e.num,
+            e.desc,
+            e.status,
+            rem,
+            e.lifetime_h.map(|h| h.to_string()).unwrap_or_else(|| "?".into()),
+            lba
+        );
+    }
+    let last = &entries[0];
+    let msg = if last.status.starts_with("Completed") {
+        "la última prueba terminó sin errores"
+    } else if last.status.contains("%") || last.remaining_pct.map(|p| p > 0).unwrap_or(false) {
+        "hay una prueba en curso"
+    } else if last.status.starts_with("Aborted") || last.status.starts_with("Interrupted") {
+        "la última prueba fue interrumpida"
+    } else {
+        "la última prueba detectó fallos"
+    };
+    println!("  lectura: {msg}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +613,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(delta_note(&before, &vacio), None);
+    }
+
+    #[test]
+    fn parse_selftest_log_tabla_ata() {
+        let text = concat!(
+            "=== SMART Self-test Log ===\n",
+            "Num  Test_Description    Status                  Remaining  LifeTime(hours)  LBA_of_first_error\n",
+            "# 1  Extended offline    Completed without error       00%     12345         -\n",
+            "# 2  Short offline       Aborted by host               90%     12340         -\n",
+            "# 3  Short offline       Failed in the first segment   40%     12339         1234567\n",
+            "# 4  Conveyance offline  Completed: read failure       90%     12300         7654321\n",
+        );
+        let e = parse_selftest_log(text);
+        assert_eq!(e.len(), 4);
+        assert_eq!((e[0].num, e[0].desc.as_str(), e[0].status.as_str()), (1, "Extended offline", "Completed without error"));
+        assert_eq!(e[0].remaining_pct, Some(0));
+        assert_eq!(e[0].lifetime_h, Some(12345));
+        assert_eq!(e[0].first_error_lba, None);
+        assert_eq!(e[1].status, "Aborted by host");
+        assert_eq!(e[1].remaining_pct, Some(90));
+        assert_eq!(e[2].first_error_lba, Some(1234567));
+        assert_eq!(e[3].status, "Completed: read failure");
+        assert_eq!(e[3].desc, "Conveyance offline");
+
+        // Variante sin columna Remaining (algunos NVMe/ATA antiguos).
+        let sin_rem = "# 1  Vendor offline   Completed without error   987   -\n";
+        let e2 = parse_selftest_log(sin_rem);
+        assert_eq!(e2.len(), 1);
+        assert_eq!(e2[0].status, "Completed without error");
+        assert_eq!(e2[0].remaining_pct, None);
+        assert_eq!(e2[0].lifetime_h, Some(987));
     }
 }
