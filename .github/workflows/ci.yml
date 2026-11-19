@@ -18,7 +18,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Tests
-        run: cargo test --bin regrow
+        shell: bash
+        run: |
+          if ! cargo test --bin regrow 2>&1 | tee test.log; then
+            grep -E "FAILED|panicked at|^error|error\[|error:" test.log | head -20 | sed 's/^/::error::/'
+            exit 1
+          fi
       - name: Build release
         run: cargo build --release
       # En macOS/Windows se comprueba además el cruce sin compilar enlazado:
