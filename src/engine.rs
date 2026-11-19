@@ -334,6 +334,12 @@ pub fn prescan<S: SectorSource + ?Sized>(
 
     let mut cur = start;
     while cur < end {
+        // Ctrl+C/kill: abortar al cerrar bloque (no esperar al bloque entero).
+        if crate::tui::interrupted() {
+            rep.aborted = true;
+            rep.last_sector = cur.saturating_sub(1);
+            break;
+        }
         let n = PRESCAN_CHUNK.min((end - cur) as usize);
         let t0 = Instant::now();
         let bulk_res = src.read_chunk(cur as u64, n, &mut chunk_buf[..n * SECTOR_SIZE]);
@@ -348,6 +354,14 @@ pub fn prescan<S: SectorSource + ?Sized>(
             // Bloque problemático: aislamiento sector a sector con medida.
             rep.retried_chunks += 1;
             for c in cur..cur + n as u32 {
+                // Dentro del bloque problemático, abortar POR SECTOR: en medio
+                // lento un bloque puede tardar minutos y la comprobación por
+                // bloque retrasaría demasiado el Ctrl+C.
+                if crate::tui::interrupted() {
+                    rep.aborted = true;
+                    rep.last_sector = c.saturating_sub(1);
+                    break;
+                }
                 let idx = cell_idx_for(c, start, cell_span);
                 let t = Instant::now();
                 let read_failed = src.read_sector(c as u64, &mut buf).is_err();
@@ -364,6 +378,9 @@ pub fn prescan<S: SectorSource + ?Sized>(
             }
         }
 
+        if rep.aborted {
+            break;
+        }
         rep.scanned += n as u64;
         rep.last_sector = cur + n as u32 - 1;
         // Panel vivo durante el prescan: refresco por bloque cuando
@@ -455,6 +472,10 @@ pub fn run<S: SectorSource + ?Sized>(
         }
         // Ruta corta: solo los problemáticos pasan por el ciclo.
         for (cur_u32, kind) in &pre.problems {
+            if crate::tui::interrupted() {
+                aborted = true;
+                break;
+            }
             let cur_u32 = *cur_u32;
             let cell_idx = cell_idx_for(cur_u32, opts.start, cell_span);
             match opts.mode {
@@ -550,6 +571,10 @@ pub fn run<S: SectorSource + ?Sized>(
     } else {
         // Ruta sector a sector (sin prescan).
         for cur_u32 in opts.start..opts.end {
+            if crate::tui::interrupted() {
+                aborted = true;
+                break;
+            }
             let cur = cur_u32 as u64;
             let cell_idx = cell_idx_for(cur_u32, opts.start, cell_span);
             stats.scanned += 1;

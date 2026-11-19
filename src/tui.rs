@@ -503,28 +503,33 @@ pub fn wrap_text(text: &str, cols: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// Señal REAL (SIGINT al propio proceso) → bandera de interrupción.
-    /// Prueba el camino completo: `signal()` FFI + handler async-safe +
-    /// lectura atómica. Solo unix (donde existe `kill`).
+    /// Señal REAL (SIGUSR1 al propio proceso) con handler de prueba aparte:
+    /// valida el camino completo `signal()` FFI → entrega → handler async-safe
+    /// → bandera atómica, SIN tocar INTERRUPTED (así ningún test de motor o
+    /// rescate en hilos ve bandera ajena). Luego se restaura la disposición.
     #[test]
     #[cfg(unix)]
-    fn sigint_real_activa_la_bandera() {
-        use super::{clear_interrupted, install_signals, interrupted};
-        install_signals();
-        clear_interrupted();
-        unsafe {
-            super::ffi::kill(super::ffi::getpid(), 2); // SIGINT
+    fn signal_ffi_entrega_al_handler() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static GOT: AtomicBool = AtomicBool::new(false);
+        extern "C" fn on_test_sig(_sig: std::os::raw::c_int) {
+            GOT.store(true, Ordering::SeqCst);
         }
-        // La entrega de la señal ocurre al volver de la syscall siguiente;
-        // el spin_loop mantiene el hilo vivo hasta entonces (sin dormir).
+        unsafe {
+            super::ffi::signal(10, Some(on_test_sig)); // SIGUSR1
+            super::ffi::kill(super::ffi::getpid(), 10);
+        }
+        // La entrega ocurre al volver de la syscall siguiente; el spin_loop
+        // mantiene el hilo vivo hasta entonces (sin dormir).
         for _ in 0..5_000_000 {
-            if interrupted() {
+            if GOT.load(Ordering::SeqCst) {
                 break;
             }
             std::hint::spin_loop();
         }
-        assert!(interrupted(), "SIGINT no activó la bandera");
-        clear_interrupted();
-        assert!(!interrupted());
+        assert!(GOT.load(Ordering::SeqCst), "SIGUSR1 no llegó al handler");
+        unsafe {
+            super::ffi::signal(10, None); // volver a la disposición por defecto
+        }
     }
 }

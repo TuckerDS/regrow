@@ -590,6 +590,12 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error durante el rescate: {e}");
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                eprintln!(
+                    "  el mapa quedó guardado en {}; repite con --resume para continuar",
+                    map_path.display()
+                );
+            }
             return ExitCode::from(1);
         }
     };
