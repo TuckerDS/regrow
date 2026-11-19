@@ -35,6 +35,7 @@ use crate::log::{Flag, Record};
 use crate::source::{SectorSource, SECTOR_SIZE};
 
 pub const DEFAULT_DELAY_MS: u64 = 200; // umbral moderno de retardo (histórico: 500 ms)
+pub const PROGRESS_FLUSH_SECS: u64 = 60; // guardado forzado del checkpoint por tiempo
 pub const MAX_BATCH: u64 = 0x7F; // lote máx. = reintentos de write_sector
 pub const BAD_SECTOR_WINDOW: u64 = 0x5000; // 10 MB cerca de un fallo ⇒ lote 1
 pub const EXTRA_VERIFY_PASSES: u32 = 3; // pasadas extrañas post-escritura
@@ -331,6 +332,7 @@ pub fn prescan<S: SectorSource + ?Sized>(
     let t_start = Instant::now();
     let mut since_poll: u64 = 0;
     let mut last_ui = Instant::now();
+    let mut last_flush = Instant::now();
 
     let mut cur = start;
     while cur < end {
@@ -397,13 +399,24 @@ pub fn prescan<S: SectorSource + ?Sized>(
             }
         }
         since_poll += n as u64;
-        if since_poll >= POLL_SECTORS {
+        // Monitor + checkpoint también POR TIEMPO: un clúster malo puede hacer
+        // que un poll de 8192 sectores tarde horas; ni la temperatura vigilada
+        // ni el progreso guardado pueden envejecer tanto.
+        if since_poll >= POLL_SECTORS || last_flush.elapsed() >= Duration::from_secs(PROGRESS_FLUSH_SECS)
+        {
             since_poll = 0;
+            last_flush = Instant::now();
+            let stats = EngineStats {
+                scanned: rep.scanned,
+               ..Default::default()
+            };
+            if let Some(f) = hooks.progress.as_mut() {
+                // Checkpoint vivo durante el prescan: si se interrumpe el
+                // proceso (corte de luz, kill duro), el reanudado no rehace
+                // todo el barrido bulk ya hecho.
+                f(rep.last_sector, &stats);
+            }
             if let Some(m) = hooks.monitor.as_mut() {
-                let stats = EngineStats {
-                    scanned: rep.scanned,
-                   ..Default::default()
-                };
                 if matches!(
                     m.poll(&PollInfo {
                         sector: rep.last_sector,
@@ -446,6 +459,7 @@ pub fn run<S: SectorSource + ?Sized>(
     let mut last_done = opts.start;
     let mut since_poll: u64 = 0;
     let mut last_ui = Instant::now();
+    let mut last_flush = Instant::now();
 
     // Par S/L de bordes: 0=S1 … fin=L1 (L se omite si el pase se aborta).
     records.push(Record {
@@ -633,6 +647,7 @@ pub fn run<S: SectorSource + ?Sized>(
                                 &mut aborted,
                                 &cells,
                                 &mut last_ui,
+                                &mut last_flush,
                             );
                             if aborted {
                                 break;
@@ -665,6 +680,7 @@ pub fn run<S: SectorSource + ?Sized>(
                                 &mut aborted,
                                 &cells,
                                 &mut last_ui,
+                                &mut last_flush,
                             );
                             if aborted {
                                 break;
@@ -707,6 +723,7 @@ pub fn run<S: SectorSource + ?Sized>(
                 &mut aborted,
                 &cells,
                 &mut last_ui,
+                &mut last_flush,
             );
             if aborted {
                 break;
@@ -850,10 +867,16 @@ fn poll_and_progress(
     aborted: &mut bool,
     cells: &[Cell; GRID_CELLS],
     last_ui: &mut Instant,
+    last_flush: &mut Instant,
 ) {
     *last_done = cur_u32;
     *since_poll += 1;
-    if *since_poll < POLL_SECTORS {
+    // Cadencia NORMAL por sectores; pero en medio lento un poll entero (8192
+    // sectores) puede tardar horas en un clúster malo. El progreso SE GUARDA
+    // cada PROGRESS_FLUSH_SECS pase lo que pase (cortes de luz, reinicios):
+    // el checkpoint nunca envejece más de un minuto.
+    if *since_poll < POLL_SECTORS && last_flush.elapsed() < Duration::from_secs(PROGRESS_FLUSH_SECS)
+    {
         if hooks.ui.is_some() && last_ui.elapsed() >= UI_TICK {
             *last_ui = Instant::now();
             if !hooks.ui.as_mut().unwrap()(cells, stats, cur_u32) {
@@ -863,6 +886,7 @@ fn poll_and_progress(
         return;
     }
     *since_poll = 0;
+    *last_flush = Instant::now();
     if let Some(m) = hooks.monitor.as_mut() {
         if matches!(
             m.poll(&PollInfo {

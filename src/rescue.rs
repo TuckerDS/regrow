@@ -21,8 +21,9 @@
 //! de lo ya bueno.
 
 use std::io;
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::mapfile::{MapFile, MapStatus};
 use crate::source::{FileImage, SectorSource, SECTOR_SIZE};
@@ -58,6 +59,15 @@ pub struct RescueOptions {
     pub retries: u8,
     pub reverse: bool,
     pub save_every_ops: usize,
+    /// Descanso entre reintentos de un sector y tras bloque fallido: en un
+    /// clúster malo el cabezal agradece pausar (campo: mejor horas de más que
+    /// un daño adicional). 0 = sin pausas.
+    pub retry_wait: Duration,
+    /// Umbral °C: si el dispositivo supera la temperatura, el rescate PAUSA
+    /// (espera a enfriar; aborta tras 10 min sin bajar). Requiere `device`.
+    pub max_temp: Option<u64>,
+    /// Dispositivo origen para el guard de temperatura (None = sin guard).
+    pub device: Option<PathBuf>,
 }
 
 impl Default for RescueOptions {
@@ -69,6 +79,9 @@ impl Default for RescueOptions {
             retries: RESCUE_RETRIES_DEFAULT,
             reverse: true,
             save_every_ops: RESCUE_SAVE_EVERY_OPS,
+            retry_wait: Duration::from_secs(2),
+            max_temp: None,
+            device: None,
         }
     }
 }
@@ -156,8 +169,16 @@ pub fn run_rescue(
     let mut block_errors = 0u64;
     let mut ops = 0usize;
     let mut last_save = Instant::now();
+    let mut last_temp = Instant::now();
 
-    let maybe_save = |map: &mut MapFile, ops: &mut usize, last_save: &mut Instant| -> io::Result<()> {
+    // Descanso tras cada fallo: en un clúster malo el cabezal agradece pausar.
+    let rest = |opts: &RescueOptions| {
+        if opts.retry_wait > Duration::ZERO {
+            thread::sleep(opts.retry_wait.min(Duration::from_secs(30)));
+        }
+    };
+
+    let mut maybe_save = |map: &mut MapFile, ops: &mut usize, last_save: &mut Instant| -> io::Result<()> {
         if crate::tui::interrupted() {
             // Ctrl+C/kill: guardar el mapa y salir; --resume retoma exacto.
             map.save(map_path)?;
@@ -171,6 +192,41 @@ pub fn run_rescue(
             map.save(map_path)?;
             *ops = 0;
             *last_save = Instant::now();
+        }
+        // Guard de temperatura (sondeo como mucho cada 45 s): el rescate PAUSA
+        // mientras el disco enfría; si no baja del umbral en 10 min, se detiene
+        // con el mapa guardado. La duración no importa; el disco, sí.
+        if let (Some(dev), Some(max)) = (opts.device.as_deref(), opts.max_temp) {
+            if last_temp.elapsed() >= Duration::from_secs(45) {
+                last_temp = Instant::now();
+                if let Ok(si) = crate::smart::query(dev) {
+                    if let Some(t0) = si.temperature_c {
+                        let mut t = t0;
+                        if t > max {
+                            eprintln!("aviso: {t} °C (umbral {max} °C) — enfriando antes de seguir…");
+                            let tc = Instant::now();
+                            while t > max.saturating_sub(2) {
+                                thread::sleep(Duration::from_secs(10));
+                                if tc.elapsed() >= Duration::from_secs(600) {
+                                    map.save(map_path)?;
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        format!(
+                                            "el disco sigue a {t} °C tras 10 min — rescate detenido (mapfile guardado)"
+                                        ),
+                                    ));
+                                }
+                                if let Ok(si2) = crate::smart::query(dev) {
+                                    if let Some(t2) = si2.temperature_c {
+                                        t = t2;
+                                    }
+                                }
+                            }
+                            println!("temperatura recuperada: {t} °C — reanudando");
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     };
@@ -189,6 +245,7 @@ pub fn run_rescue(
                 Err(_) => {
                     map.set(pos, n as u64, MapStatus::Failed, 0);
                     block_errors += 1;
+                    rest(&opts);
                 }
             }
             pos += n as u64;
@@ -223,6 +280,7 @@ pub fn run_rescue(
                     Err(_) => {
                         map.set(sa, sl, MapStatus::Failed, 0);
                         block_errors += 1;
+                        rest(&opts);
                     }
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
@@ -254,6 +312,10 @@ pub fn run_rescue(
                     Err(_) => {
                         map.set(lba, 1, MapStatus::Failed, attempt as u8);
                         block_errors += 1;
+                        // pausa entre tentativas del mismo sector (no tras la última)
+                        if attempt < opts.retries.max(1) {
+                            rest(&opts);
+                        }
                     }
                 }
             }
@@ -278,6 +340,7 @@ pub fn run_rescue(
                     blocks_ok += 1;
                 } else {
                     block_errors += 1;
+                    rest(&opts);
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
                 emit_progress(map, &mut on_progress, Phase::Reverse, pos_ex, blocks_ok, block_errors);
@@ -381,6 +444,9 @@ mod tests {
             retries,
             reverse,
             save_every_ops: 16,
+            retry_wait: Duration::ZERO, // tests sin pausas
+            max_temp: None,
+            device: None,
         }
     }
 
