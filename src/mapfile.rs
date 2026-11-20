@@ -13,9 +13,15 @@
 //!   guardado jamás corrompe el mapa, y jamás deja un `.tmp` engañoso.
 //! - CRC32 al final del archivo: un mapa truncado o alterado se rechaza en
 //!   la carga, no se "arregla" a medias.
-//! - Compatibilidad de ida con el formato de mapfile de texto estilo
-//!   ddrescue (`import_text`/`export_text`): los formatos son datos, y
-//!   permitir continuar un rescate ajeno es la razón de existir del mapa.
+//! - Compatibilidad de ida con el mapfile de texto de ddrescue
+//!   (`import_text`/`export_text`): los formatos son datos, y permitir
+//!   continuar un rescate ajeno es la razón de existir del mapa. Unidades y
+//!   leyenda verificadas contra el manual y código de ddrescue 1.29:
+//!   posiciones en **bytes** (`0x…`, alineadas a 512) y estados `+` terminado,
+//!   `-` sector malo, `?` sin intentar, `*` recortado fallido, `/` rascado
+//!   fallido (leyenda vigente desde ddrescue 1.23; el export de regrow la
+//!   respeta: Good→`+`, Failed→`?`, Scraped→`/`). El binario propio usa su
+//!   propia leyenda (`+ - ?`) y unidades de sectores.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -23,6 +29,7 @@ use std::path::Path;
 
 pub const MAP_MAGIC: &[u8; 8] = b"RGROWMP1";
 pub const MAP_VERSION: u32 = 1;
+const SECTOR_BYTES: u64 = crate::source::SECTOR_SIZE as u64;
 
 /// Estado de un rango del dominio.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,11 +38,12 @@ pub enum MapStatus {
     Good,
     /// `-` fallido, aún sin reintentar (incluye "sin intentar").
     Failed,
-    /// `?` fallido después de agotar los reintentos.
+    /// `?` fallido después de agotar los reintentos (en ddrescue: `/`).
     Scraped,
 }
 
 impl MapStatus {
+    /// Leyenda del binario propio (RGROWMP1).
     pub fn char(self) -> char {
         match self {
             MapStatus::Good => '+',
@@ -50,6 +58,28 @@ impl MapStatus {
             '-' => Some(MapStatus::Failed),
             '?' => Some(MapStatus::Scraped),
             _ => None,
+        }
+    }
+
+    /// Leyenda real de ddrescue 1.23+ (verificada en su manual 1.29):
+    /// `+` terminado, `-` sector malo, `?` sin intentar, `*` recortado
+    /// fallido, `/` rascado fallido. Lo pendiente para nosotros (`? * -`)
+    /// entra como Failed; `/` ya fue rascado: Scraped.
+    pub fn from_ddrescue_char(c: char) -> Option<MapStatus> {
+        match c {
+            '+' => Some(MapStatus::Good),
+            '-' | '?' | '*' => Some(MapStatus::Failed),
+            '/' => Some(MapStatus::Scraped),
+            _ => None,
+        }
+    }
+
+    /// Cómo exportamos cada estado para que ddrescue lo entienda sin sorpresas.
+    fn ddrescue_char(self) -> char {
+        match self {
+            MapStatus::Good => '+',
+            MapStatus::Failed => '?',  // ddrescue lo vuelve a intentar
+            MapStatus::Scraped => '/', // ddrescue lo vuelve a rascar
         }
     }
 
@@ -280,44 +310,72 @@ impl MapFile {
 
     // ---------------------------------------------------- texto ddrescue ----
 
-    /// Exporta al formato de mapfile de texto (estilo ddrescue): columnas
-    /// `start size flags` en hexadecimal. Los reintentos quedan solo en el
-    /// binario propio para no romper la compatibilidad.
+    /// Exporta al formato de texto de ddrescue: posiciones en BYTES (`0x…`)
+    /// y leyenda 1.23+ (`+`/`?`//`/`), de modo que ddrescue y ddrescuelog
+    /// pueden leer el mapa sin reinterpretar nada. Los reintentos quedan solo
+    /// en el binario propio.
     pub fn export_text(&self, path: &Path) -> io::Result<()> {
         let mut s = String::new();
         s.push_str("# Mapfile. Created by regrow\n");
-        s.push_str(&format!("# domain: {} sectores de 512 B\n", self.sector_count));
-        s.push_str("#      start        size   #flags\n");
+        s.push_str("#      pos        size  status\n");
         for e in &self.entries {
-            s.push_str(&format!("{:016x} {:016x} {}\n", e.start, e.len, e.status.char()));
+            s.push_str(&format!(
+                "0x{:08x}  0x{:08x}  {}\n",
+                e.start * SECTOR_BYTES,
+                e.len * SECTOR_BYTES,
+                e.status.ddrescue_char()
+            ));
         }
         fs::write(path, s.as_bytes())
     }
 
-    /// Importa un mapfile de texto (acepta hex con o sin prefijo `0x`, el
-    /// formato de ddrescue moderno y el clásico). El dominio real lo fija el
-    /// origen (`sector_count`), no el texto importado.
+    /// Importa un mapfile de texto. El dominio real lo fija el origen
+    /// (`sector_count`), no el texto importado. Acepta:
+    /// - ddrescue 1.20+: posiciones en bytes (hex `0x…`, alineadas a 512) y
+    ///   leyenda `+ - ? * /`; ignora comentarios (incluso tras espacio), la
+    ///   línea de estado y cualquier fila malformada.
+    /// - Exportaciones propias antiguas (v0.1.0): sectores con cabecera
+    ///   `# domain: … sectores de 512 B`, detectadas por esa marca.
     pub fn import_text(path: &Path, sector_count: u64) -> Result<MapFile, String> {
         let text = fs::read_to_string(path)
             .map_err(|e| format!("no se puede leer {}: {e}", path.display()))?;
+        let legacy_sectors = text
+            .lines()
+            .any(|l| l.starts_with("# domain:") && l.contains("sectores de 512 B"));
         let mut mf = MapFile::new(sector_count);
         let mut loaded = 0usize;
         for line in text.lines() {
+            // En ddrescue un '#' empieza comentario al inicio o a media línea.
+            let line = match line.split_once('#') {
+                Some((before, _)) => before,
+                None => line,
+            };
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
                 continue;
             }
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() != 3 {
-                continue; // líneas de estado tipo "current_pos" u otras
+                continue; // p. ej. la línea de estado `0x03730600 / 1`
             }
-            // Tolerante: una fila cuyo segundo campo no es hex (p. ej. la de
-            // estado `0x03730600 / 1` de ddrescue) simplemente se ignora.
-            let Ok(start) = parse_hex(cols[0]) else { continue };
-            let Ok(len) = parse_hex(cols[1]) else { continue };
-            let Some(status) = MapStatus::from_char(cols[2].chars().next().unwrap_or(' ')) else {
-                continue;
+            let Ok(pos) = parse_hex(cols[0]) else { continue };
+            let Ok(size) = parse_hex(cols[1]) else { continue };
+            let (start, len) = if legacy_sectors {
+                (pos, size)
+            } else {
+                // ddrescue escribe bytes; en disco siempre múltiplos de 512.
+                if pos % SECTOR_BYTES != 0 || size % SECTOR_BYTES != 0 {
+                    continue;
+                }
+                (pos / SECTOR_BYTES, size / SECTOR_BYTES)
             };
+            let first = cols[2].chars().next().unwrap_or(' ');
+            let parsed = if legacy_sectors {
+                MapStatus::from_char(first)
+            } else {
+                MapStatus::from_ddrescue_char(first)
+            };
+            let Some(status) = parsed else { continue };
             if len == 0 || start >= sector_count {
                 continue;
             }
@@ -477,22 +535,57 @@ mod tests {
         }
         assert_eq!(imported.entries(), &expect[..]);
 
-        // Aceptar el estilo moderno con prefijo 0x y comentarios.
+        // Aceptar el formato real de ddrescue 1.29: bytes alineados, leyenda
+        // `+ - ? /`, línea de estado intercalada y comentarios.
         let raw = concat!(
             "# Mapfile. Created by GNU ddrescue version 1.29\n",
-            "# Start time:   2026-10-13 14:52:09\n",
+            "# Command line: ddrescue -d -a 10485760 /dev/sda5 img map\n",
             "# current_pos  current_status  current_pass\n",
             "0x03730600     /               1\n",
             "#      pos        size  status\n",
             "0x00000000  0x01BE8C00  +\n",
             "0x01BE8C00  0x00045400  -\n",
             "0x01C2F000  0x000C6200  ?\n",
+            "0x01CF5200  0x00008000  /  # rascado y sigue malo\n",
         );
         fs::write(&p, raw).unwrap();
         let im = MapFile::import_text(&p, 1 << 30).unwrap();
-        assert_eq!(im.entries().len(), 3);
+        assert_eq!(im.entries().len(), 4);
+        // Bytes → sectores: 0x01BE8C00 B = 57158 sectores de dominio bueno.
+        assert_eq!(im.entries()[0].start, 0);
+        assert_eq!(im.entries()[0].len, 0x01BE8C00 / SECTOR_BYTES);
+        assert_eq!(im.entries()[1].start, 0x01BE8C00 / SECTOR_BYTES);
         assert_eq!(im.entries()[1].status, MapStatus::Failed);
-        assert_eq!(im.entries()[2].status, MapStatus::Scraped);
+        // `?` en ddrescue 1.23+ significa SIN INTENTAR: entra como pendiente.
+        assert_eq!(im.entries()[2].status, MapStatus::Failed);
+        // `/` fue rascado y sigue malo: Scraped.
+        assert_eq!(im.entries()[3].status, MapStatus::Scraped);
+        assert_eq!(im.entries()[3].len, 0x8000 / SECTOR_BYTES);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_format_propio_antiguo_por_sectores() {
+        // Exportaciones de regrow 0.1.0 (sectores + leyenda propia): la marca
+        // `# domain: … sectores de 512 B` las sigue leyendo bien.
+        let dir = tmpdir("legacy");
+        let p = dir.join("old.txt");
+        fs::write(
+            &p,
+            concat!(
+                "# Mapfile. Created by regrow\n",
+                "# domain: 4096 sectores de 512 B\n",
+                "#      start        size   #flags\n",
+                "0000000000000000 0000000000000400 +\n",
+                "0000000000000400 0000000000000100 ?\n",
+                "0000000000000500 0000000000000100 -\n",
+            ),
+        )
+        .unwrap();
+        let im = MapFile::import_text(&p, 4096).unwrap();
+        assert_eq!(im.entries()[1].status, MapStatus::Scraped);
+        assert_eq!(im.entries()[1].start, 0x400);
+        assert_eq!(im.entries()[2].status, MapStatus::Failed);
         let _ = fs::remove_dir_all(&dir);
     }
 
