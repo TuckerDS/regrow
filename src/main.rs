@@ -134,11 +134,19 @@ fn usage() -> ! {
          \x20                    sobrescribirlo (def: <imagen>.respaldo)\n\
          \x20 --no-backup        (rescue) desactivar el respaldo — no recomendado\n\
          \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
-         \x20 --map F            (rescue) mapfile propio (def: <imagen-destino>.map)\n\
+         \x20 --map F            mapfile propio: en rescue el de la imagen\n\
+          \x20                    destino (def: <imagen-destino>.map); en las pasadas\n\
+          \x20                    con --import-map, el mapa de resultados\n\
+          \x20                    (def: <mapfile-ajeno>.regrow.map)\n\
          \x20 --export-map F     (rescue) exportar además el mapa en texto compatible\n\
          \x20 --import-map F     (rescue) continuar desde un mapfile de texto ajeno\n\
          \x20                    (rescue: la ruta posicional es la IMAGEN DESTINO sparse;\n\
          \x20                    el origen es SIEMPRE --raw/--dev; --resume retoma no linealmente)\n\
+          \x20                    (scan/repair/refresh/regenerate) PASADA QUIRÚRGICA: la\n\
+          \x20                    pasada recorre SOLO los tramos que ese mapa deja\n\
+          \x20                    pendientes (lo bueno no se lee ni se escribe) y anota lo\n\
+          \x20                    reparado en --map; los tramos quedan en DISKn.ranges y\n\
+          \x20                    --resume los retoma sin volver a dar el mapfile\n\
          \x20 --fill-from F      (rescue) modo relleno: completar los huecos pendientes de la\n\
          \x20                    imagen desde una SEGUNDA COPIA del origen (donante, archivo).\n\
          \x20                    No necesita --raw/--dev; los `+` de la imagen jamás se tocan;\n\
@@ -1089,6 +1097,199 @@ fn cli_speedtest(o: &CommonOpts) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Plan de una **pasada quirúrgica** sobre disco (`scan|repair|refresh|
+/// regenerate` con `--import-map`): la pasada recorre SOLO los tramos que un
+/// mapfile ajeno declaró pendientes, y anota el resultado en un mapfile propio.
+pub(crate) struct SurgicalPlan {
+    /// Tramos a tocar `[inicio, fin)`, ascendentes y disjuntos.
+    pub ranges: Vec<(u32, u32)>,
+    /// Sectores pendientes totales: base del porcentaje y del ETA.
+    pub total: u64,
+    /// Mapa de resultados (None en `scan`: leer no arregla nada).
+    pub map: Option<mapfile::MapFile>,
+    pub map_path: PathBuf,
+    pub export_path: Option<PathBuf>,
+    /// Ventana efectiva de la pasada: del primer al último tramo (la barra y
+    /// los contadores zooman sobre la zona dañada, no sobre el disco entero).
+    pub window: (u32, u32),
+}
+
+/// Mapa donde una pasada quirúrgica anota lo reparado, cuando no se dio `--map`.
+fn default_result_map(import: &Path) -> PathBuf {
+    let mut s = import.to_string_lossy().into_owned();
+    s.push_str(".regrow.map");
+    PathBuf::from(s)
+}
+
+/// «1 tramo pendiente» / «7 tramos pendientes»: concuerda el número.
+fn tramos_pendentes(n: usize) -> String {
+    if n == 1 {
+        "1 tramo pendiente".to_string()
+    } else {
+        format!("{n} tramos pendientes")
+    }
+}
+
+/// Construye el plan quirúrgico de la pasada.
+///
+/// - Reanudando: manda el plan guardado (`diskstats/DISKn.ranges`), recortado
+///   al punto del checkpoint. Así `--resume` no depende de volver a dar el
+///   mapfile original.
+/// - Arranque nuevo: importa el mapfile ajeno y toma sus tramos pendientes
+///   dentro de la ventana pedida.
+///
+/// `Ok(None)` = pasada normal (rango continuo).
+fn build_surgical_plan(
+    o: &CommonOpts,
+    mode: RunMode,
+    total: u64,
+    win: (u32, u32),
+) -> Result<Option<SurgicalPlan>, ExitCode> {
+    let rp = state::ranges_path(&o.log_dir, o.id);
+    let write_mode = matches!(mode, RunMode::Repair | RunMode::Refresh | RunMode::Regenerate);
+    let pending_status = [mapfile::MapStatus::Failed, mapfile::MapStatus::Scraped];
+
+    // 1) ¿Hay un plan guardado que reanudar?
+    if o.resume {
+        match state::RangePlan::load(&rp) {
+            Ok(saved) if saved.unit == o.id && saved.mode == mode => {
+                let ranges = saved.clamped(win.0, win.1);
+                let map_path = PathBuf::from(&saved.result_map);
+                let map = match mapfile::MapFile::load(&map_path) {
+                    Ok(m) if m.sector_count == total => Some(m),
+                    Ok(m) => {
+                        eprintln!(
+                            "error: el mapa de resultados {} declara {} sectores y la unidad tiene {total}",
+                            map_path.display(),
+                            m.sector_count
+                        );
+                        return Err(ExitCode::from(1));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "error: la pasada quirúrgica reanuda anotando en {}, pero no se puede leer: {e}",
+                            map_path.display()
+                        );
+                        return Err(ExitCode::from(1));
+                    }
+                };
+                let pend: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
+                println!(
+                    "reanudando la pasada quirúrgica ({}): {} ({} sectores) según {}",
+                    mode_word(mode),
+                    tramos_pendentes(ranges.len()),
+                    pend,
+                    rp.display()
+                );
+                let window = match (ranges.first(), ranges.last()) {
+                    (Some(f), Some(l)) => (f.0, l.1),
+                    _ => win,
+                };
+                return Ok(Some(SurgicalPlan {
+                    ranges,
+                    total: pend,
+                    map,
+                    map_path,
+                    export_path: o.export_map.clone(),
+                    window,
+                }));
+            }
+            Ok(saved) => {
+                eprintln!(
+                    "error: {} es el plan de una pasada {} de la unidad {}; bórralo para empezar limpia",
+                    rp.display(),
+                    mode_word(saved.mode),
+                    saved.unit
+                );
+                return Err(ExitCode::from(1));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("error leyendo el plan de tramos {}: {e}", rp.display());
+                return Err(ExitCode::from(1));
+            }
+        }
+    }
+
+    // 2) Sin plan guardado: se construye desde el mapfile ajeno, si se pidió.
+    let Some(import) = &o.import_map else {
+        // Pasada continua: no debe quedar ningún plan de tramos rezagado que
+        // confunda a un `--resume` posterior.
+        state::RangePlan::remove(&rp);
+        return Ok(None);
+    };
+    let map = match mapfile::MapFile::import_text(import, total) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error importando el mapfile {}: {e}", import.display());
+            return Err(ExitCode::from(2));
+        }
+    };
+    let (good, _, scraped, _) = map.stats();
+    // `pending_ranges` devuelve (inicio, LONGITUD): aquí se guarda (inicio, fin).
+    let raw = map.pending_ranges(win.0 as u64, win.1 as u64, &pending_status);
+    let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(raw.len());
+    let mut pend: u64 = 0;
+    for &(a, len) in &raw {
+        if a + len > u32::MAX as u64 {
+            eprintln!(
+                "error: el mapfile llega al sector {}, por encima de los {} sectores (≈2 TiB) que esta versión maneja",
+                a + len,
+                u32::MAX
+            );
+            return Err(ExitCode::from(1));
+        }
+        ranges.push((a as u32, (a + len) as u32));
+        pend += len;
+    }
+    println!(
+        "mapa ajeno importado desde {}: {} sectores buenos NO se leen ni se escriben",
+        import.display(),
+        good
+    );
+    let ventana = if win.0 == 0 && win.1 as u64 == total.min(u32::MAX as u64) {
+        "todo el disco".to_string()
+    } else {
+        format!("sectores {}..{}", win.0, win.1)
+    };
+    println!(
+        "bisturí: {} ({} sectores, {:.2} GB; {} sectores ya rascados por otros) — ventana: {}",
+        tramos_pendentes(ranges.len()),
+        pend,
+        pend as f64 * 512.0 / 1e9,
+        scraped,
+        ventana
+    );
+    let map_path = o.map_path.clone().unwrap_or_else(|| default_result_map(import));
+    let window = match (ranges.first(), ranges.last()) {
+        (Some(f), Some(l)) => (f.0, l.1),
+        _ => win,
+    };
+    // El plan viaja en su sidecar para que un `--resume` posterior no necesite
+    // ni el mapfile original ni repetir la ventana.
+    let saved = state::RangePlan {
+        mode,
+        unit: o.id,
+        window_start: win.0,
+        window_end: win.1,
+        source: import.to_string_lossy().into_owned(),
+        result_map: map_path.to_string_lossy().into_owned(),
+        ranges: ranges.clone(),
+    };
+    if let Err(e) = saved.save(&rp) {
+        eprintln!("error guardando el plan de tramos {}: {e}", rp.display());
+        return Err(ExitCode::from(1));
+    }
+    Ok(Some(SurgicalPlan {
+        ranges,
+        total: pend,
+        map: write_mode.then_some(map),
+        map_path,
+        export_path: o.export_map.clone(),
+        window,
+    }))
+}
+
 fn cli_pass(o0: &CommonOpts, mode: RunMode) -> ExitCode {
     // Checkpoint: ¿retomar? (un checkpoint solo reanuda su propio
     // modo y su rango debe seguir siendo válido en el disco que se abra).
@@ -1161,7 +1362,42 @@ fn cli_pass(o0: &CommonOpts, mode: RunMode) -> ExitCode {
         Err(c) => return c,
     };
 
-    process_run(&mut *src, &display, dev_path.as_deref(), &o, start, end, mode, prev.as_ref())
+    // Pasada quirúrgica (`--import-map`): la pasada recorre solo los tramos
+    // pendientes del mapa ajeno, y su ventana se ciñe al primer y último tramo.
+    let plan = match build_surgical_plan(&o, mode, src.sector_count(), (start, end)) {
+        Ok(p) => p,
+        Err(c) => return c,
+    };
+    let plan = match plan {
+        None => None,
+        Some(p) if p.ranges.is_empty() => {
+            println!("no queda ningún tramo pendiente en la ventana: nada que hacer");
+            Checkpoint::remove(&state_path(&o.log_dir, o.id));
+            state::RangePlan::remove(&state::ranges_path(&o.log_dir, o.id));
+            return ExitCode::SUCCESS;
+        }
+        Some(p) => {
+            o.start = p.window.0;
+            o.end = Some(p.window.1);
+            Some(p)
+        }
+    };
+    let (run_start, run_end) = match &plan {
+        Some(p) => p.window,
+        None => (start, end),
+    };
+
+    process_run(
+        &mut *src,
+        &display,
+        dev_path.as_deref(),
+        &o,
+        run_start,
+        run_end,
+        mode,
+        prev.as_ref(),
+        plan,
+    )
 }
 
 /// Identidad + versión + licencia en pantalla .
@@ -1371,6 +1607,7 @@ pub(crate) fn process_run(
     end: u32,
     mode: RunMode,
     prev: Option<&Checkpoint>,
+    mut plan: Option<SurgicalPlan>,
 ) -> ExitCode {
     // Una interrupción pendiente de una pasada anterior (menú) no debe
     // abortar esta.
@@ -1380,6 +1617,37 @@ pub(crate) fn process_run(
     opts.bands = o.bands;
     opts.allow_data_loss = o.allow_data_loss;
     opts.prescan = o.prescan && mode != RunMode::Regenerate;
+
+    // Red de seguridad: una pasada quirúrgica interrumpida NO se reanuda como
+    // barrido continuo (el menú no trae plan). Barrer el rango volvería a leer
+    // —y en `regenerate` a reescribir— zonas que el mapa declara sanas.
+    if prev.is_some() && plan.is_none() {
+        let rp = state::ranges_path(&o.log_dir, o.id);
+        if let Ok(saved) = state::RangePlan::load(&rp) {
+            if saved.unit == o.id && saved.mode == mode {
+                eprintln!(
+                    "error: hay una pasada quirúrgica {} pendiente ({} sectores en {}, plan en {}). Reanúdala por CLI con --resume, o borra ese plan y el checkpoint para barrer el rango continuo.",
+                    mode_word(mode),
+                    saved.total(),
+                    tramos_pendentes(saved.ranges.len()),
+                    rp.display()
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Bisturí: la pasada visita solo los tramos del plan quirúrgico.
+    let sparse_total: Option<u64> = plan.as_ref().map(|p| p.total);    let plan_ranges = plan.as_ref().map(|p| p.ranges.len()).unwrap_or(0);
+    let surgical = plan.is_some();
+    if let Some(p) = &plan {
+        opts.ranges = Some(p.ranges.clone());
+    }
+    // El mapa de resultados se desprende del plan (los hooks prestan cada
+    // pieza por separado). En `scan` no hay mapa: leer no arregla nada.
+    let mut result: Option<(mapfile::MapFile, PathBuf, Option<PathBuf>)> = plan
+        .as_mut()
+        .and_then(|p| p.map.take().map(|m| (m, p.map_path.clone(), p.export_path.clone())));
 
     // Los mensajes largos se envuelven al ancho REAL de la terminal: el
     // envoltado automático mezclándose con las filas vivas desalinea el
@@ -1427,6 +1695,13 @@ pub(crate) fn process_run(
         media.label(),
         mode_word(mode)
     ));
+    if surgical {
+        say(format!(
+            "pasada quirúrgica: {} ({} sectores); del resto del rango no se lee ni se escribe ni un sector",
+            tramos_pendentes(plan_ranges),
+            sparse_total.unwrap_or(0)
+        ));
+    }
     if phys != 512 {
         say(format!(
             "bloques físicos de {phys} B (4Kn): acceso por bloque alineado; las escrituras preservan los sectores vecinos (lectura-modificación-escritura)"
@@ -1517,7 +1792,7 @@ pub(crate) fn process_run(
             mode,
             &[Cell::Empty; GRID_CELLS],
             &EngineStats::default(),
-            (end - start) as u64,
+            sparse_total.unwrap_or((end - start) as u64),
             0,
             &paint,
         );
@@ -1569,8 +1844,12 @@ pub(crate) fn process_run(
             }
             if !live && last_status.elapsed().as_secs() >= 30 {
                 last_status = Instant::now();
-                let range = (end - start) as u64;
-                let done = (sector - start) as u64;
+                // Con tramos del mapa, el % y el ETA se miden sobre los sectores
+                // pendientes: el rango del disco no es el trabajo real.
+                let (range, done) = match sparse_total {
+                    Some(t) => (t, stats.scanned),
+                    None => ((end - start) as u64, (sector - start) as u64),
+                };
                 let el = t_start.elapsed().as_secs().max(1);
                 let pct = 100.0 * done as f64 / range.max(1) as f64;
                 let eta = if done > 0 {
@@ -1594,7 +1873,7 @@ pub(crate) fn process_run(
                     mode,
                     cells,
                     stats,
-                    (end - start) as u64,
+                    sparse_total.unwrap_or((end - start) as u64),
                     t_start.elapsed().as_secs(),
                     &paint,
                 );
@@ -1630,6 +1909,50 @@ pub(crate) fn process_run(
         let _ = writeln!(std::io::stdout());
     }
 
+    // Resultado de la pasada quirúrgica anotado en su mapa: lo verificado tras
+    // reescribir (`R`) pasa a bueno; lo que sigue malo (`B`) queda pendiente con
+    // un reintento más contabilizado. Se anota también en un pase abortado (sus
+    // registros parciales son válidos): un SIGKILL brutal es lo único que
+    // perdería esta anotación, y solo cuesta repetir sectores, no perderlos.
+    if let Some((map, map_path, export_path)) = result.as_mut() {
+        let (mut certified, mut still) = (0u64, 0u64);
+        for r in &report.records {
+            match r.flag {
+                Flag::R => {
+                    map.set(r.sector as u64, r.run as u64, mapfile::MapStatus::Good, 0);
+                    certified += r.run as u64;
+                }
+                Flag::B => {
+                    let s = r.sector as u64;
+                    let rt = map.retries_at(s).saturating_add(1);
+                    map.set(s, r.run as u64, mapfile::MapStatus::Failed, rt);
+                    still += r.run as u64;
+                }
+                _ => {}
+            }
+        }
+        match map.save(map_path.as_path()) {
+            Ok(()) => say(format!(
+                "mapa de resultados: {} sectores reparados y verificados, {} siguen pendientes → {}",
+                certified,
+                still,
+                map_path.display()
+            )),
+            Err(e) => {
+                eprintln!(
+                    "aviso: no se pudo guardar el mapa de resultados {}: {e}",
+                    map_path.display()
+                )
+            }
+        }
+        if let Some(x) = export_path.as_ref() {
+            match map.export_text(x) {
+                Ok(()) => say(format!("mapa de texto exportado a {}", x.display())),
+                Err(e) => eprintln!("aviso: no se pudo exportar el mapa de texto: {e}"),
+            }
+        }
+    }
+
     // Resumen (los contadores del checkpoint previo se acumulan).
     let totals = match prev {
         Some(p) => Checkpoint::merge_stats(p.stats, report.stats),
@@ -1658,7 +1981,7 @@ pub(crate) fn process_run(
     }
     if totals.healthy_skipped > 0 {
         say(format!(
-            "{} sectores sanos salteados (prescan)",
+            "{} sectores sanos salteados (prescan o mapa ajeno)",
             totals.healthy_skipped
         ));
     }
@@ -1705,6 +2028,12 @@ pub(crate) fn process_run(
             report.last_sector,
             sp.display()
         ));
+        if surgical {
+            say(format!(
+                "los tramos pendientes quedaron en {}: --resume los retoma sin volver a dar el mapfile",
+                state::ranges_path(&o.log_dir, unit).display()
+            ));
+        }
         return ExitCode::from(1);
     }
 
@@ -1714,6 +2043,10 @@ pub(crate) fn process_run(
 
     // Pasada completa: el checkpoint ya no hace falta.
     Checkpoint::remove(&sp);
+    if surgical {
+        // Idem el plan de tramos: la pasada quirúrgica terminó los suyos.
+        state::RangePlan::remove(&state::ranges_path(&o.log_dir, unit));
+    }
 
     ExitCode::SUCCESS
 }
@@ -1759,6 +2092,64 @@ mod tests {
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
         }
+    }
+
+    /// `--import-map` en las pasadas: los tramos pendientes se guardan como
+    /// (inicio, FIN) — no (inicio, longitud) — y la ventana se ciñe a ellos.
+    #[test]
+    fn plan_quirurgico_convierte_longitudes_en_fines() {
+        let dir = std::env::temp_dir().join(format!("regrow_plan_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let map = dir.join("map.log");
+        fs::write(
+            &map,
+            "# Mapfile. Created by GNU ddrescue version 1.29\n\
+             #      pos        size  status\n\
+             0x00000000  0x00100000  +\n\
+             0x00100000  0x00000400  ?\n\
+             0x00100400  0x000ff000  +\n\
+             0x001ff400  0x00000c00  /\n\
+             0x00200000  0x00200000  +\n",
+        )
+        .unwrap();
+        let mut o = opts(&dir, 7, false);
+        o.import_map = Some(map.clone());
+        // Dominio 8192 sectores: el mapa cubre todo (lo no mapeado cuenta pendiente).
+        let plan = build_surgical_plan(&o, RunMode::Repair, 8192, (0, 8192))
+            .unwrap()
+            .expect("el mapa deja tramos");
+        assert_eq!(plan.ranges, vec![(2048, 2050), (4090, 4096)]);
+        assert_eq!(plan.total, 8);
+        assert_eq!(plan.window, (2048, 4096));
+        assert_eq!(plan.map_path, default_result_map(&map));
+        assert!(plan.map.is_some(), "repair sí anota su resultado");
+        // El sidecar queda escrito y es reparseable (base del `--resume`).
+        let saved = state::RangePlan::load(&state::ranges_path(&dir, 7)).unwrap();
+        assert_eq!(saved.ranges, plan.ranges);
+        assert_eq!(saved.mode, RunMode::Repair);
+        assert_eq!(saved.window_end, 8192);
+        state::RangePlan::remove(&state::ranges_path(&dir, 7));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// En `scan` no hay mapa de resultados: leer no arregla nada.
+    #[test]
+    fn plan_quirurgico_scan_no_anota_mapa() {
+        let dir = std::env::temp_dir().join(format!("regrow_plan_scan_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let map = dir.join("map.log");
+        fs::write(&map, "0x00000000  0x00000400  -\n").unwrap();
+        let mut o = opts(&dir, 8, false);
+        o.import_map = Some(map);
+        let plan = build_surgical_plan(&o, RunMode::Scan, 2, (0, 2))
+            .unwrap()
+            .expect("hay tramos");
+        assert_eq!(plan.ranges, vec![(0, 2)]);
+        assert!(plan.map.is_none());
+        state::RangePlan::remove(&state::ranges_path(&dir, 8));
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Puerta de regenerate : SSD bloqueado sin flag; con flag,

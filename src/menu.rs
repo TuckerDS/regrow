@@ -447,7 +447,8 @@ fn process_run_menu(
     mode: RunMode,
     prev: Option<&Checkpoint>,
 ) -> ExitCode {
-    process_run(src, display, dev_path, o, start, end, mode, prev)
+    // El menú trabaja por rangos continuos: nunca aporta plan quirúrgico.
+    process_run(src, display, dev_path, o, start, end, mode, prev, None)
 }
 
 // ---------- Panel de estadísticas por unidad ----------
