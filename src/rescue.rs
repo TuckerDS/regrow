@@ -561,9 +561,10 @@ mod tests {
             &txt,
             concat!(
                 "# Mapfile. Created by herramienta ajena\n",
-                "0x00000000  0x00000200  +\n",
-                "0x00000200  0x00000001  ?\n",
-                "0x00000201  0x00000200  -\n",
+                "#      pos        size  status\n",
+                "0x00000000  0x00040000  +\n",
+                "0x00040000  0x00000200  ?\n",
+                "0x00040200  0x0003FE00  -\n",
             ),
         )
         .unwrap();
