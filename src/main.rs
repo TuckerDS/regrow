@@ -97,7 +97,8 @@ pub struct CommonOpts {
 
 fn usage() -> ! {
     eprintln!(
-        "uso: regrow <scan|repair|refresh|regenerate|testwrite|prescan|speedtest> <imagen> [opciones]\n\
+        "uso: regrow                    abre el menú interactivo (arranque pelado)\n\
+         \x20 regrow <scan|repair|refresh|regenerate|testwrite|prescan|speedtest> <imagen> [opciones]\n\
          \x20 regrow <…> --raw N [opciones]\n\
          \x20 regrow <…> --dev PATH [opciones]\n\
          \x20 regrow smart --raw N | --dev PATH\n\
@@ -415,7 +416,11 @@ pub fn main() -> ExitCode {
     tui::install_signals();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        usage();
+        // Arranque pelado: abre el menú interactivo (la herramienta se maneja
+        // principalmente por él; equivale a `regrow menu`). La ayuda para
+        // scripting o modo por lotes sigue en `regrow --help`.
+        println!("{}", version_line());
+        return menu::run(&parse_common(&[]));
     }
     match args[0].as_str() {
         "--version" | "-V" | "version" => {
