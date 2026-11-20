@@ -172,7 +172,7 @@ impl ImageBackup {
         })
     }
 
-    fn put_chunk(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn put_chunk(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
         self.file.write_all(data)?;
         Ok(())
