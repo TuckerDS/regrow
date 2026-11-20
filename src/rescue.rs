@@ -20,7 +20,8 @@
 //! cualquier pasada siguiente con `--resume` retoma sin releer un solo byte
 //! de lo ya bueno.
 
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,6 +69,9 @@ pub struct RescueOptions {
     pub max_temp: Option<u64>,
     /// Dispositivo origen para el guard de temperatura (None = sin guard).
     pub device: Option<PathBuf>,
+    /// Sidecar disperso donde respaldar cada sector ANTES de sobrescribirlo
+    /// en la imagen (None = sin respaldo; la regla de campo pide uno).
+    pub backup: Option<PathBuf>,
 }
 
 impl Default for RescueOptions {
@@ -82,6 +86,7 @@ impl Default for RescueOptions {
             retry_wait: Duration::from_secs(2),
             max_temp: None,
             device: None,
+            backup: None,
         }
     }
 }
@@ -130,10 +135,79 @@ pub fn prepare_image(path: &Path, sectors: u64) -> io::Result<FileImage> {
     }
 }
 
-fn try_block(src: &mut dyn SectorSource, img: &mut FileImage, lba: u64, n: usize, buf: &mut Vec<u8>) -> io::Result<()> {
+/// Fallo de un intento de rescate. `Read` es un fallo normal del origen (el
+/// sector se reintentará con la lógica de su fase). `Fatal` es un fallo del
+/// respaldo o de la escritura en la imagen: aborta el rescate entero — la
+/// imagen jamás se toca sin su respaldo sector a sector delante.
+enum TryErr {
+    /// Fallo de lectura del origen: normal en el rescate (lo reintenta la
+    /// fase correspondiente); se conserva para diagnósticos futuros.
+    Read(#[allow(dead_code)] io::Error),
+    /// Fallo del respaldo o de la escritura en la imagen: aborta el rescate.
+    Fatal(io::Error),
+}
+
+/// Respaldo sector a sector ANTES de sobrescribir: un sidecar disperso
+/// (`<imagen>.respaldo` por defecto) guarda, en el offset propio de cada
+/// sector, el contenido que tenía la IMAGEN justo antes de esa escritura.
+/// Un sector cuya lectura falla no se escribe y por tanto no se respalda: el
+/// sidecar solo contiene contenido previo real. Con `--resume` se reabre sin
+/// truncar: los respaldos de pasadas anteriores se conservan.
+pub struct ImageBackup {
+    file: File,
+    #[allow(dead_code)]
+    path: PathBuf,
+}
+
+impl ImageBackup {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn put_chunk(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
+        self.file.write_all(data)?;
+        Ok(())
+    }
+}
+
+impl Drop for ImageBackup {
+    fn drop(&mut self) {
+        // El respaldo debe sobrevivir incluso a un abort del proceso.
+        let _ = self.file.sync_all();
+    }
+}
+
+/// Copia el bloque `src → img` solo después de respaldar en `bak` el contenido
+/// que la imagen tiene ahora en ese rango. Orden deliberado: primero se LEE
+/// el origen (si falla, no hay nada que escribir ni respaldar).
+fn try_block(
+    src: &mut dyn SectorSource,
+    img: &mut FileImage,
+    bak: Option<&mut ImageBackup>,
+    lba: u64,
+    n: usize,
+    buf: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), TryErr> {
     buf.resize(n * SECTOR_SIZE, 0);
-    src.read_chunk(lba, n, buf)?;
-    img.write_chunk(lba, n, buf)
+    src.read_chunk(lba, n, buf).map_err(TryErr::Read)?;
+    if let Some(b) = bak {
+        scratch.resize(n * SECTOR_SIZE, 0);
+        img.read_chunk(lba, n, scratch).map_err(TryErr::Fatal)?;
+        b.put_chunk(lba, &scratch[..n * SECTOR_SIZE])
+            .map_err(TryErr::Fatal)?;
+    }
+    img.write_chunk(lba, n, buf).map_err(TryErr::Fatal)?;
+    Ok(())
 }
 
 fn emit_progress<F: FnMut(&Progress)>(
@@ -165,11 +239,19 @@ pub fn run_rescue(
 ) -> io::Result<RescueReport> {
     let t0 = Instant::now();
     let mut buf: Vec<u8> = Vec::with_capacity(opts.block.max(1) * SECTOR_SIZE);
+    let mut scratch: Vec<u8> = Vec::new();
     let mut blocks_ok = 0u64;
     let mut block_errors = 0u64;
     let mut ops = 0usize;
     let mut last_save = Instant::now();
     let mut last_temp = Instant::now();
+
+    // El respaldo se abre ANTES de tocar nada: si no se puede crear el
+    // sidecar, el rescate ni siquiera empieza.
+    let mut bak = match &opts.backup {
+        Some(p) => Some(ImageBackup::open(p)?),
+        None => None,
+    };
 
     // Descanso tras cada fallo: en un clúster malo el cabezal agradece pausar.
     let rest = |opts: &RescueOptions| {
@@ -237,15 +319,19 @@ pub fn run_rescue(
         let mut pos = a;
         while pos < a + len {
             let n = opts.block.min((a + len - pos) as usize).max(1);
-            match try_block(src, img, pos, n, &mut buf) {
+            match try_block(src, img, bak.as_mut(), pos, n, &mut buf, &mut scratch) {
                 Ok(()) => {
                     map.set(pos, n as u64, MapStatus::Good, 0);
                     blocks_ok += 1;
                 }
-                Err(_) => {
+                Err(TryErr::Read(_)) => {
                     map.set(pos, n as u64, MapStatus::Failed, 0);
                     block_errors += 1;
                     rest(&opts);
+                }
+                Err(TryErr::Fatal(e)) => {
+                    map.save(map_path)?;
+                    return Err(e);
                 }
             }
             pos += n as u64;
@@ -272,15 +358,19 @@ pub fn run_rescue(
                 if sl == 0 {
                     continue;
                 }
-                match try_block(src, img, sa, sl as usize, &mut buf) {
+                match try_block(src, img, bak.as_mut(), sa, sl as usize, &mut buf, &mut scratch) {
                     Ok(()) => {
                         map.set(sa, sl, MapStatus::Good, 0);
                         blocks_ok += 1;
                     }
-                    Err(_) => {
+                    Err(TryErr::Read(_)) => {
                         map.set(sa, sl, MapStatus::Failed, 0);
                         block_errors += 1;
                         rest(&opts);
+                    }
+                    Err(TryErr::Fatal(e)) => {
+                        map.save(map_path)?;
+                        return Err(e);
                     }
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
@@ -302,20 +392,24 @@ pub fn run_rescue(
     for lba in singles {
             let mut recovered = false;
             for attempt in 1..=opts.retries.max(1) {
-                match try_block(src, img, lba, 1, &mut buf) {
+                match try_block(src, img, bak.as_mut(), lba, 1, &mut buf, &mut scratch) {
                     Ok(()) => {
                         map.set(lba, 1, MapStatus::Good, attempt - 1);
                         blocks_ok += 1;
                         recovered = true;
                         break;
                     }
-                    Err(_) => {
+                    Err(TryErr::Read(_)) => {
                         map.set(lba, 1, MapStatus::Failed, attempt as u8);
                         block_errors += 1;
                         // pausa entre tentativas del mismo sector (no tras la última)
                         if attempt < opts.retries.max(1) {
                             rest(&opts);
                         }
+                    }
+                    Err(TryErr::Fatal(e)) => {
+                        map.save(map_path)?;
+                        return Err(e);
                     }
                 }
             }
@@ -335,12 +429,19 @@ pub fn run_rescue(
             while pos_ex > a {
                 let n = opts.block.min((pos_ex - a) as usize).max(1);
                 pos_ex -= n as u64;
-                if let Ok(()) = try_block(src, img, pos_ex, n, &mut buf) {
-                    map.set(pos_ex, n as u64, MapStatus::Good, 0);
-                    blocks_ok += 1;
-                } else {
-                    block_errors += 1;
-                    rest(&opts);
+                match try_block(src, img, bak.as_mut(), pos_ex, n, &mut buf, &mut scratch) {
+                    Ok(()) => {
+                        map.set(pos_ex, n as u64, MapStatus::Good, 0);
+                        blocks_ok += 1;
+                    }
+                    Err(TryErr::Read(_)) => {
+                        block_errors += 1;
+                        rest(&opts);
+                    }
+                    Err(TryErr::Fatal(e)) => {
+                        map.save(map_path)?;
+                        return Err(e);
+                    }
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
                 emit_progress(map, &mut on_progress, Phase::Reverse, pos_ex, blocks_ok, block_errors);
@@ -447,6 +548,7 @@ mod tests {
             retry_wait: Duration::ZERO, // tests sin pausas
             max_temp: None,
             device: None,
+            backup: None,
         }
     }
 
@@ -577,6 +679,76 @@ mod tests {
         assert_eq!(rep.good, 1023);
         assert_eq!(rep.scraped, 1);
         assert_eq!(*src.reads_other.borrow(), 0x1FF, "el mapa ajeno evita releer el dominio ya bueno (511 sectores relectos)");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respaldo_guarda_el_contenido_previo_de_la_imagen() {
+        // Regla dura: cada sector se guarda ANTES de sobrescribirlo, en el
+        // offset propio del sidecar disperso.
+        let dir = tmpdir("respaldo");
+        let sectors = 64u64;
+        let img_path = dir.join("im.raw");
+        {
+            let mut img = prepare_image(&img_path, sectors).unwrap();
+            img.write_sector(3, &[0x5Au8; SECTOR_SIZE]).unwrap(); // contenido previo
+        }
+        let bk_path = dir.join("im.raw.respaldo");
+        let mut map = MapFile::new(sectors);
+        let mut src = MockRescue::new(sectors);
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut o = opts(sectors, 8, 1, false);
+        o.backup = Some(bk_path.clone());
+        run_rescue(&mut src, &mut img, &mut map, &o, &dir.join("own.map"), |_| {}).unwrap();
+        // Lo que había en el sector 3 está en el sidecar...
+        let bk = fs::read(&bk_path).unwrap();
+        assert_eq!(&bk[3 * SECTOR_SIZE..4 * SECTOR_SIZE], &[0x5Au8; SECTOR_SIZE]);
+        // ...y el sector 3 de la imagen tiene ahora el contenido del origen.
+        let mut one = [0u8; SECTOR_SIZE];
+        FileImage::open_ro(&img_path)
+            .unwrap()
+            .read_sector(3, &mut one)
+            .unwrap();
+        assert_eq!(one, [MockRescue::byte_for(3); SECTOR_SIZE]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sector_no_leido_no_se_escribe_ni_se_respalda() {
+        // Un sector que no se pudo leer deja hueco honesto en la imagen y no
+        // genera respaldo (no se escribió nada).
+        let dir = tmpdir("respaldo2");
+        let sectors = 32u64;
+        let img_path = dir.join("im.raw");
+        let bk_path = dir.join("im.raw.respaldo");
+        let mut map = MapFile::new(sectors);
+        let mut src = MockRescue::new(sectors);
+        src.poison(10);
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut o = opts(sectors, 4, 1, false);
+        o.backup = Some(bk_path.clone());
+        let rep = run_rescue(&mut src, &mut img, &mut map, &o, &dir.join("own.map"), |_| {}).unwrap();
+        assert_eq!(rep.scraped, 1);
+        let bytes = fs::read(&img_path).unwrap();
+        assert!(bytes[10 * SECTOR_SIZE..11 * SECTOR_SIZE].iter().all(|&b| b == 0));
+        let bk = fs::read(&bk_path).unwrap();
+        assert!(bk[10 * SECTOR_SIZE..11 * SECTOR_SIZE].iter().all(|&b| b == 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respaldo_imposible_aborta_antes_de_tocar_la_imagen() {
+        // Si el sidecar no se puede abrir, el rescate ni siquiera empieza.
+        let dir = tmpdir("respaldo3");
+        let sectors = 8u64;
+        let img_path = dir.join("im.raw");
+        let mut map = MapFile::new(sectors);
+        let mut src = MockRescue::new(sectors);
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut o = opts(sectors, 4, 1, false);
+        o.backup = Some(dir.clone()); // un directorio no es un archivo
+        let err = run_rescue(&mut src, &mut img, &mut map, &o, &dir.join("own.map"), |_| {});
+        assert!(err.is_err(), "sin sidecar accesible el rescate debe negarse a empezar");
         let _ = fs::remove_dir_all(&dir);
     }
 }
