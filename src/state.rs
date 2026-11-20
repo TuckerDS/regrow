@@ -597,8 +597,8 @@ mod tests {
             unit: 4,
             window_start: 100,
             window_end: 1000,
-            source: "/ruta/sdb5_rescate.log".into(),
-            result_map: "/ruta/sdb5_rescate.log.regrow.map".into(),
+            source: "/ruta/disco1_rescate.log".into(),
+            result_map: "/ruta/disco1_rescate.log.regrow.map".into(),
             ranges: vec![(100, 120), (200, 210), (500, 501)],
         };
         plan.save(&p).unwrap();
