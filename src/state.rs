@@ -161,6 +161,136 @@ impl Checkpoint {
     }
 }
 
+/// Plan de tramos de una **pasada quirúrgica**: los tramos pendientes que un
+/// mapfile ajeno (`--import-map` en scan/repair/refresh/regenerate) declaró
+/// objetivos. Se guarda junto al checkpoint para que `--resume` sepa QUÉ
+/// tramos quedan por tocar aunque ya no se pase el mapfile original.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangePlan {
+    pub mode: RunMode,
+    pub unit: u32,
+    /// Ventana de la pasada (exclusivo): acota los tramos.
+    pub window_start: u32,
+    pub window_end: u32,
+    /// Mapfile ajeno del que se derivaron los tramos (informativo).
+    pub source: String,
+    /// Mapa donde la pasada anota lo reparado (RGROWMP1).
+    pub result_map: String,
+    /// Tramos pendientes `[inicio, fin)`, ascendentes y disjuntos.
+    pub ranges: Vec<(u32, u32)>,
+}
+
+pub fn ranges_path(log_dir: &Path, unit: u32) -> std::path::PathBuf {
+    log_dir.join(format!("DISK{unit}.ranges"))
+}
+
+impl RangePlan {
+    /// Sectores pendientes totales del plan.
+    pub fn total(&self) -> u64 {
+        self.ranges.iter().map(|&(a, b)| (b - a) as u64).sum()
+    }
+
+    /// Tramos recortados a `[from, to)`. De un tramo que empieza antes de
+    /// `from` se conserva la parte restante. Vacío si ya no queda nada.
+    pub fn clamped(&self, from: u32, to: u32) -> Vec<(u32, u32)> {
+        self.ranges
+            .iter()
+            .filter_map(|&(a, b)| {
+                let a = a.max(from);
+                let b = b.min(to);
+                if a < b {
+                    Some((a, b))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                fs::create_dir_all(dir)?;
+            }
+        }
+        let mut body = String::from("regrow.ranges.v1\r\n");
+        body.push_str(&format!(
+            "mode={}\r\nunit={}\r\nwindow={} {}\r\nsource={}\r\nresult_map={}\r\n",
+            mode_word(self.mode),
+            self.unit,
+            self.window_start,
+            self.window_end,
+            self.source,
+            self.result_map,
+        ));
+        for &(a, b) in &self.ranges {
+            body.push_str(&format!("{a} {b}\r\n"));
+        }
+        // Escritura atómica: tempfile + rename (un corte no corrompe el plan).
+        let tmp = path.with_extension("ranges.tmp");
+        fs::write(&tmp, body.as_bytes())?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn load(path: &Path) -> io::Result<RangePlan> {
+        let text = fs::read_to_string(path)?;
+        let bad = || io::Error::other("plan de tramos mal formado");
+        let num = |s: &str| s.parse::<u32>().map_err(|_| bad());
+        let mut mode: Option<RunMode> = None;
+        let mut unit: Option<u32> = None;
+        let mut window: Option<(u32, u32)> = None;
+        let mut source = String::new();
+        let mut result_map = String::new();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if line == "regrow.ranges.v1" || line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                match k {
+                    "mode" => {
+                        mode = Some(parse_mode(v).ok_or_else(|| io::Error::other("modo inválido"))?);
+                    }
+                    "unit" => unit = Some(num(v)?),
+                    "window" => {
+                        let (a, b) = v.split_once(' ').ok_or_else(bad)?;
+                        window = Some((num(a)?, num(b)?));
+                    }
+                    "source" => source = v.to_string(),
+                    "result_map" => result_map = v.to_string(),
+                    _ => return Err(bad()),
+                }
+            } else {
+                let (a, b) = line.split_once(' ').ok_or_else(bad)?;
+                ranges.push((num(a)?, num(b)?));
+            }
+        }
+        let mode = mode.ok_or_else(|| io::Error::other("campo ausente: mode"))?;
+        let unit = unit.ok_or_else(|| io::Error::other("campo ausente: unit"))?;
+        let (window_start, window_end) = window.ok_or_else(|| io::Error::other("campo ausente: window"))?;
+        if ranges.iter().any(|&(a, b)| a >= b)
+            || ranges.windows(2).any(|w| w[0].1 > w[1].0 || w[0].1 > w[1].1)
+        {
+            return Err(io::Error::other("plan de tramos corrupto (vacíos, solapados o desordenados)"));
+        }
+        Ok(RangePlan {
+            mode,
+            unit,
+            window_start,
+            window_end,
+            source,
+            result_map,
+            ranges,
+        })
+    }
+
+    pub fn remove(path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// Plan de reanudación validado . Un checkpoint solo se puede
 /// reanudar si es del modo que se va a ejecutar, su rango original sigue
 /// dentro del disco y todavía quedan sectores pendientes.
@@ -432,6 +562,46 @@ mod tests {
         assert_eq!(resume_plan(&back, RunMode::Scan, 1_000), None);
         assert_eq!(resume_plan(&back, RunMode::Refresh, 1_000).unwrap().start, 40);
         Checkpoint::remove(&p);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// El plan de tramos de una pasada quirúrgica sobrevive a un corte y
+    /// permite reanudar sin volver a dar el mapfile original.
+    #[test]
+    fn plan_de_tramos_roundtrip_y_recorte() {
+        let dir = std::env::temp_dir().join(format!("regrow_ranges_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = ranges_path(&dir, 4);
+        assert_eq!(
+            RangePlan::load(&p).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let plan = RangePlan {
+            mode: RunMode::Repair,
+            unit: 4,
+            window_start: 100,
+            window_end: 1000,
+            source: "/ruta/sdb5_rescate.log".into(),
+            result_map: "/ruta/sdb5_rescate.log.regrow.map".into(),
+            ranges: vec![(100, 120), (200, 210), (500, 501)],
+        };
+        plan.save(&p).unwrap();
+        let back = RangePlan::load(&p).unwrap();
+        assert_eq!(back, plan);
+        assert_eq!(back.total(), 31);
+        // Reanudando en 205: del tramo (200,210) queda su parte restante.
+        assert_eq!(back.clamped(205, 1000), vec![(205, 210), (500, 501)]);
+        // Ventana agotada: nada que reanudar.
+        assert_eq!(back.clamped(501, 1000), vec![]);
+        // Tramos solapados (archivo corrupto o tocado a mano): no se tragan.
+        fs::write(
+            &p,
+            "regrow.ranges.v1\r\nmode=repair\r\nunit=4\r\nwindow=100 1000\r\nsource=x\r\nresult_map=y\r\n100 300\r\n200 210\r\n",
+        )
+        .unwrap();
+        assert!(RangePlan::load(&p).is_err());
+        RangePlan::remove(&p);
         fs::remove_dir_all(&dir).ok();
     }
 }

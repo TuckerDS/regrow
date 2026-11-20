@@ -43,6 +43,15 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   Mismas protecciones que el rescate: respaldo sidecar previo, mapfile
   atómico, y los tramos ya buenos de la imagen jamás se reescriben.
 - Línea de estado periódica también cuando no hay terminal.
+- Pasada **quirúrgica** en `scan`/`repair`/`refresh`/`regenerate` con
+  `--import-map`: la pasada recorre SOLO los tramos que un mapfile de texto
+  ajeno deja pendientes (lo ya bueno no se lee ni se escribe) y anota el
+  resultado en un mapfile propio (`--map`; defecto `<mapfile-ajeno>.regrow.map`):
+  lo reescrito y verificado pasa a bueno, y lo que sigue malo queda pendiente
+  con un reintento más contabilizado. Los tramos se guardan en `DISKn.ranges`,
+  de modo que `--resume` los retoma sin volver a dar el mapfile; una reanudación
+  de una pasada quirúrgica no cae nunca al barrido continuo. El porcentaje y el
+  ETA se miden sobre los sectores pendientes, no sobre el disco entero.
 
 ### Fixed
 

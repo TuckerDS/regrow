@@ -116,6 +116,17 @@ impl MapFile {
         &self.entries
     }
 
+    /// Reintentos acumulados en el rango que contiene `sector` (0 si el
+    /// sector está sin mapear). Lo usan las pasadas quirúrgicas para anotar
+    /// cuántas veces un tramo pendiente ha fracasado ya.
+    pub fn retries_at(&self, sector: u64) -> u8 {
+        self.entries
+            .iter()
+            .find(|e| e.start <= sector && sector < e.start + e.len)
+            .map(|e| e.retries)
+            .unwrap_or(0)
+    }
+
     /// Marca [start, start+len) con `status`, partiendo los rangos existentes
     /// que la nueva operación cubre solo a medias, y fusionando vecinos
     /// idénticos. `retries` se fija para el rango resultante.
@@ -593,5 +604,20 @@ mod tests {
     fn crc32_vector_conocido() {
         // Vector canónico: "123456789" -> 0xCBF43926.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// `retries_at` lee los reintentos del rango que contiene el sector
+    /// (0 si está sin mapear): lo usa la pasada quirúrgica para contabilizar
+    /// cuántas veces un tramo pendiente ha fracasado.
+    #[test]
+    fn retries_at_lee_el_rango_contenedor() {
+        let mut m = MapFile::new(100);
+        m.set(10, 20, MapStatus::Failed, 3);
+        m.set(60, 5, MapStatus::Good, 0);
+        assert_eq!(m.retries_at(10), 3);
+        assert_eq!(m.retries_at(29), 3);
+        assert_eq!(m.retries_at(30), 0); // fuera del rango: sin mapear
+        assert_eq!(m.retries_at(60), 0);
+        assert_eq!(m.retries_at(999), 0);
     }
 }

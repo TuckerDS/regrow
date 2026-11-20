@@ -77,6 +77,12 @@ pub struct EngineOptions {
     /// Prescan bulk para Scan/Repair/Refresh (los bloques sanos se saltean
     /// sin lectura sector a sector). No aplica a Regenerate: ahí se escribe todo.
     pub prescan: bool,
+    /// Pasada quirúrgica: tramos `[inicio, fin)` a procesar, ascendentes y
+    /// disjuntos, siempre dentro de `[start, end)`. Con `Some(...)` la pasada
+    /// visita SOLO esos sectores (los huecos se declaran sanos por un mapa
+    /// ajeno) y cada sector visitado se trata como problemático aunque hoy lea
+    /// bien: la autoridad sobre qué tocar es el mapa, no el latómetro.
+    pub ranges: Option<Vec<(u32, u32)>>,
 }
 
 impl EngineOptions {
@@ -89,6 +95,7 @@ impl EngineOptions {
             bands: Some(DEFAULT_LATENCY_BANDS),
             allow_data_loss: false,
             prescan: false,
+            ranges: None,
         }
     }
 
@@ -446,6 +453,19 @@ pub fn run<S: SectorSource + ?Sized>(
     mut on_cell: impl FnMut(&[Cell; GRID_CELLS]),
 ) -> EngineReport {
     assert!(opts.start < opts.end, "rango vacío");
+    if let Some(rs) = &opts.ranges {
+        // Los tramos del mapa deben venir ordenados, disjuntos y dentro del
+        // rango de la pasada (así lo garantiza quien los construye).
+        let mut prev_end = opts.start;
+        for &(a, b) in rs {
+            assert!(a < b, "tramo vacío en la lista del mapa");
+            assert!(
+                a >= prev_end && b <= opts.end,
+                "tramos del mapa fuera de rango, solapados o desordenados"
+            );
+            prev_end = b;
+        }
+    }
     let span = (opts.end - opts.start) as u64;
     let cell_span = (span + GRID_CELLS as u64 - 1) / GRID_CELLS as u64;
 
@@ -471,7 +491,9 @@ pub fn run<S: SectorSource + ?Sized>(
     // Prescan opcional (Scan/Repair/Refresh): lista corta de problemáticos.
     // `prescan` solo usa `hooks.monitor` (no respalda ni reporta progreso),
     // así que se le presta el propio `hooks` y el préstamo termina aquí.
-    let pre = if opts.prescan && opts.mode != RunMode::Regenerate {
+    // Con tramos del mapa NO se prescanea: los tramos YA son la lista corta,
+    // y barrer el rango completo contradice el bisturí (no releer lo sano).
+    let pre = if opts.prescan && opts.mode != RunMode::Regenerate && opts.ranges.is_none() {
         Some(prescan(src, opts, &mut hooks, &mut on_cell))
     } else {
         None
@@ -583,8 +605,15 @@ pub fn run<S: SectorSource + ?Sized>(
             on_cell(&cells);
         }
     } else {
-        // Ruta sector a sector (sin prescan).
-        for cur_u32 in opts.start..opts.end {
+        // Ruta sector a sector (sin prescan). Con tramos del mapa (bisturí)
+        // solo se visitan esos tramos: los huecos entre ellos se dan por sanos
+        // gracias al mapa ajeno y ni se leen.
+        let sparse = opts.ranges.as_ref();
+        let iter: Box<dyn Iterator<Item = u32>> = match sparse {
+            Some(rs) => Box::new(rs.iter().flat_map(|&(a, b)| a..b)),
+            None => Box::new(opts.start..opts.end),
+        };
+        for cur_u32 in iter {
             if crate::tui::interrupted() {
                 aborted = true;
                 break;
@@ -628,7 +657,8 @@ pub fn run<S: SectorSource + ?Sized>(
                     // en Regenerate. Sanos en Repair/Refresh: se omiten (sin
                     // registro). Refresh considera problemática cualquier banda;
                     // Repair solo T4 (retardo clásico).
-                    let problematic = read_failed || band >= problem_band(opts.mode);
+                    let problematic =
+                        read_failed || band >= problem_band(opts.mode) || sparse.is_some();
                     let must_write = opts.mode == RunMode::Regenerate || problematic;
                     if must_write {
                         if read_failed && !opts.allow_data_loss {
@@ -727,6 +757,25 @@ pub fn run<S: SectorSource + ?Sized>(
             );
             if aborted {
                 break;
+            }
+        }
+        if sparse.is_some() {
+            // Celdas que ningún tramo tocó: el mapa las declara sanas.
+            if !aborted {
+                for idx in 0..GRID_CELLS {
+                    if cells[idx] == Cell::Empty {
+                        cells[idx] = Cell::Scan;
+                    }
+                }
+                on_cell(&cells);
+            }
+            // Los huecos entre tramos son sectores saltados gracias al mapa.
+            // (Si el pase se abortó no se sabe cuántos: se deja en 0.)
+            if !aborted {
+                let touched: u64 = sparse.iter().map(|rs| {
+                    rs.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>()
+                }).sum();
+                stats.healthy_skipped = span - touched;
             }
         }
     }
@@ -1128,9 +1177,64 @@ mod tests {
         assert_eq!(rep.stats.data_lost, 2);
     }
 
+    /// Bisturí por mapa ajeno: la pasada visita SOLO los tramos pendientes,
+    /// reescribe los pendientes que hoy leen (con su propio contenido) y respeta
+    /// el default seguro sobre los ilegibles.
     #[test]
-    fn repair_no_toca_sectores_sanos() {
-        let mut src = MockSource::new(50);
+    fn quirurgica_solo_toca_los_tramos_del_mapa() {
+        let mut src = MockSource::new(1000);
+        src.broken.insert(50);
+        let mut o = fast_opts(RunMode::Repair, 0, 1000);
+        o.prescan = true; // con tramos del mapa el prescan se ignora: no se barre lo sano
+        o.ranges = Some(vec![(10, 12), (50, 51), (300, 302)]);
+        let rep = run(&mut src, &o, hooks_empty(), collect());
+        assert_eq!(rep.stats.scanned, 5);
+        // Los pendientes legibles se reescriben con SU contenido (nunca ciegas).
+        assert_eq!(src.writes, vec![10, 11, 300, 301]);
+        assert!(src.written_bytes.iter().all(|&(l, b)| b == l as u8));
+        // El ilegible no se toca sin --allow-data-loss.
+        assert!(!src.written.contains(&50));
+        assert_eq!(rep.stats.recovered, 4);
+        assert_eq!(rep.stats.bad, 1);
+        assert_eq!(rep.stats.data_lost, 0);
+        // Los huecos entre tramos son sectores saltados gracias al mapa.
+        assert_eq!(rep.stats.healthy_skipped, 995);
+        // Un fallo no fusiona runs a ambos lados de su hueco.
+        let runs: Vec<(u32, char, u32)> = rep
+            .records
+            .iter()
+            .map(|r| (r.sector, r.flag.char(), r.run))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                (0, 'S', 1),
+                (10, 'R', 2),
+                (50, 'B', 1),
+                (300, 'R', 2),
+                (999, 'L', 1),
+            ]
+        );
+    }
+
+    /// En `scan` quirúrgico tampoco se escribe nada, pero la visita se ciñe a
+    /// los tramos (barato: verificar hoy lo que un mapa dejó pendiente).
+    #[test]
+    fn quirurgica_scan_visita_solo_los_tramos() {
+        let mut src = MockSource::new(1000);
+        src.broken.insert(50);
+        let mut o = fast_opts(RunMode::Scan, 0, 1000);
+        o.prescan = true;
+        o.ranges = Some(vec![(10, 12), (50, 51)]);
+        let rep = run(&mut src, &o, hooks_empty(), collect());
+        assert_eq!(rep.stats.scanned, 3);
+        assert_eq!(rep.stats.bad, 1);
+        assert!(src.writes.is_empty());
+        assert_eq!(rep.stats.healthy_skipped, 997);
+    }
+
+    #[test]
+    fn repair_no_toca_sectores_sanos() {        let mut src = MockSource::new(50);
         let rep = run(&mut src, &fast_opts(RunMode::Repair, 0, 50), hooks_empty(), collect());
         assert!(src.writes.is_empty());
         assert_eq!(rep.stats.bad, 0);
