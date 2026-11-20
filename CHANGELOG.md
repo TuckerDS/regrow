@@ -27,6 +27,12 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   al enfriar 2 °C, aborta con el mapa guardado si no enfría en 10 min.
 - El progreso (checkpoint del escaneo y mapfile del rescate) se reescribe
   cada ≤60 s aunque el medio vaya extremadamente lento.
+- `rescue` respalda cada sector ANTES de sobrescribirlo en la imagen: sidecar
+  disperso `<imagen>.respaldo` al mismo LBA; si el respaldo falla, el rescate
+  se detiene sin tocar más la imagen. `--backup-file R` / `--no-backup`.
+- `surfmap` puede dibujar el estado completo desde un mapfile de texto
+  (`surfmap --import-map mapa.log --sectors N`): mapa rescatado/pendiente/
+  rascado con tooltips por celda y tabla de los tramos pendientes más grandes.
 - Línea de estado periódica también cuando no hay terminal.
 
 ### Fixed
