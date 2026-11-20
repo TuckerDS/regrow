@@ -23,6 +23,7 @@
 mod backup;
 mod config;
 mod engine;
+mod fill;
 mod log;
 mod mapfile;
 mod menu;
@@ -85,6 +86,9 @@ pub struct CommonOpts {
     pub no_backup: bool,             // desactivar el respaldo (no recomendado)
     pub export_map: Option<PathBuf>, // exportar además el mapa en texto
     pub import_map: Option<PathBuf>, // continuar desde un mapfile de texto ajeno
+    pub fill_from: Option<PathBuf>,  // (rescue) relleno: donante = segunda copia del origen
+    pub donor_map: Option<PathBuf>,  // (rescue) mapfile del donante (propio o de texto)
+    pub allow_zeros: bool,           // (rescue/fill) escribir también sectores todo-cero del donante
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
     pub cells: usize,         // resolución del mapa (def 1024)
@@ -135,6 +139,13 @@ fn usage() -> ! {
          \x20 --import-map F     (rescue) continuar desde un mapfile de texto ajeno\n\
          \x20                    (rescue: la ruta posicional es la IMAGEN DESTINO sparse;\n\
          \x20                    el origen es SIEMPRE --raw/--dev; --resume retoma no linealmente)\n\
+         \x20 --fill-from F      (rescue) modo relleno: completar los huecos pendientes de la\n\
+         \x20                    imagen desde una SEGUNDA COPIA del origen (donante, archivo).\n\
+         \x20                    No necesita --raw/--dev; los `+` de la imagen jamás se tocan;\n\
+         \x20                    sin --donor-map no se escriben sectores todo-cero del donante\n\
+         \x20 --donor-map F      (rescue/fill) mapfile del donante (propio o texto estilo\n\
+         \x20                    ddrescue): solo se copia lo que su mapa marca como bueno\n\
+         \x20 --allow-zeros      (rescue/fill) copiar también los sectores todo-cero del donante\n\
          \x20 --sectors N        (surfmap) dominio del mapa; si falta, se toma del DISKn.state\n\
          \x20 --cells N          (surfmap) resolución 16..8192 (def 1024)\n\
          \x20 --raw N            unidad crudo nativa (root/admin requerido)\n\
@@ -235,6 +246,9 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         no_backup: false,
         export_map: None,
         import_map: None,
+        fill_from: None,
+        donor_map: None,
+        allow_zeros: false,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
         out_path: None,
@@ -277,6 +291,9 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--no-backup" => o.no_backup = true,
             "--export-map" => o.export_map = Some(take_path(args, &mut i, "--export-map")),
             "--import-map" => o.import_map = Some(take_path(args, &mut i, "--import-map")),
+            "--fill-from" => o.fill_from = Some(take_path(args, &mut i, "--fill-from")),
+            "--donor-map" => o.donor_map = Some(take_path(args, &mut i, "--donor-map")),
+            "--allow-zeros" => o.allow_zeros = true,
             "--sectors" => o.sectors = Some(take_num(args, &mut i, "--sectors")),
             "--cells" => o.cells = take_num(args, &mut i, "--cells").clamp(16, 8192) as usize,
             "--out" => o.out_path = Some(take_path(args, &mut i, "--out")),
@@ -491,6 +508,9 @@ fn cli_selftest(args: &[String]) -> ExitCode {
 }
 
 fn cli_rescue(o: &CommonOpts) -> ExitCode {
+    if o.fill_from.is_some() {
+        return cli_fill(o);
+    }
     if o.raw.is_none() && o.dev.is_none() {
         eprintln!("error: rescue necesita un origen crudo (--raw N | --dev PATH); la ruta posicional es la imagen DESTINO");
         return ExitCode::from(2);
@@ -649,6 +669,215 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
             map_path.display()
         );
     }
+    ExitCode::SUCCESS
+}
+
+/// `rescue --fill-from`: relleno aditivo de los huecos pendientes de una
+/// imagen desde una segunda copia del origen (el «donante»). No destructivo
+/// sobre el disco: son dos archivos. El dominio lo fija la imagen existente
+/// (o `--sectors` para crearla sparse). La imagen jamás recibe un byte que
+/// no venga del donante, y solo en posiciones pendientes del mapa destino.
+fn cli_fill(o: &CommonOpts) -> ExitCode {
+    let Some(donor_path) = o.fill_from.clone() else {
+        return ExitCode::from(2);
+    };
+    let Some(dest) = o.image.clone() else {
+        eprintln!("error: el modo relleno necesita la imagen destino (ruta posicional antes de las opciones)");
+        return ExitCode::from(2);
+    };
+    let sec = source::SECTOR_SIZE as u64;
+    let total: u64 = if dest.exists() {
+        match fs::metadata(&dest) {
+            Ok(m) if m.len() % sec == 0 => m.len() / sec,
+            Ok(m) => {
+                eprintln!("error: la imagen {} tiene {} bytes, que no es múltiplo de 512", dest.display(), m.len());
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        match o.sectors {
+            Some(n) if n > 0 => n,
+            _ => {
+                eprintln!("error: la imagen destino no existe; indica --sectors N para crearla sparse antes del relleno");
+                return ExitCode::from(2);
+            }
+        }
+    };
+    let mut img = match rescue::prepare_image(&dest, total) {
+        Ok(im) => im,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut donor = match FileImage::open_ro(&donor_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: no se puede abrir el donante {}: {e}", donor_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let donor_total = donor.sector_count();
+
+    // Mapa destino: import de texto ajeno, el propio existente (el relleno es
+    // aditivo por diseño: se respeta siempre), o todo pendiente (imagen nueva).
+    let map_path = o.map_path.clone().unwrap_or_else(|| {
+        let mut s = dest.to_string_lossy().into_owned();
+        s.push_str(".map");
+        PathBuf::from(s)
+    });
+    let mut map = if let Some(imp) = &o.import_map {
+        match mapfile::MapFile::import_text(imp, total) {
+            Ok(m) => {
+                let (g, f, s, u) = m.stats();
+                println!("mapa ajeno importado desde {}: {} buenos · {} pendientes", imp.display(), g, f + s + u);
+                m
+            }
+            Err(e) => {
+                eprintln!("error importando el mapfile: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if map_path.exists() {
+        match mapfile::MapFile::load(&map_path) {
+            Ok(m) => {
+                if m.sector_count != total {
+                    eprintln!(
+                        "error: el mapfile es de un dominio de {} sectores y la imagen tiene {total}",
+                        m.sector_count
+                    );
+                    return ExitCode::from(1);
+                }
+                let (g, f, s, u) = m.stats();
+                println!("usando el mapfile {}: {} buenos preservados · {} pendientes", map_path.display(), g, f + s + u);
+                m
+            }
+            Err(e) => {
+                eprintln!("error leyendo el mapfile: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        mapfile::MapFile::new(total)
+    };
+
+    // Mapa del donante: binario propio (RGROWMP1) o de texto estilo ddrescue.
+    let dmap = match &o.donor_map {
+        Some(dp) => match mapfile::MapFile::load(dp)
+            .or_else(|_| mapfile::MapFile::import_text(dp, total))
+        {
+            Ok(m) => {
+                let (g, _, _, _) = m.stats();
+                println!("mapa del donante {}: {} sectores certificables", dp.display(), g);
+                Some(m)
+            }
+            Err(e) => {
+                eprintln!("error leyendo el mapfile del donante: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+
+    let total32 = total.min(u32::MAX as u64) as u32;
+    let start = o.start;
+    let end = o.end.unwrap_or(total32).min(total32);
+    if start >= end {
+        eprintln!("error: rango vacío (start={start} end={end}, total={total32})");
+        return ExitCode::from(1);
+    }
+
+    println!(
+        "relleno: {} ({total} sectores) ← donante {} ({} sectores) · ventana [{start}..{end}) · mapa {}",
+        dest.display(),
+        donor_path.display(),
+        donor_total,
+        map_path.display()
+    );
+    if donor_total < total {
+        println!("aviso: el donante llega hasta el sector {donor_total}; los pendientes más allá no podrán rellenarse desde él");
+    }
+    if dmap.is_none() {
+        println!(
+            "sin mapa del donante: se filtran sus sectores todo-cero (un hueco y un cero son indistinguibles en un archivo); usa --donor-map para certificar, o --allow-zeros para escribirlos igualmente"
+        );
+    }
+    let backup_path = if o.no_backup {
+        None
+    } else {
+        Some(o.backup_file.clone().unwrap_or_else(|| {
+            let mut s = dest.to_string_lossy().into_owned();
+            s.push_str(".respaldo");
+            PathBuf::from(s)
+        }))
+    };
+    match &backup_path {
+        Some(p) => println!("respaldo sector a sector antes de escribir: {}", p.display()),
+        None => println!("aviso: relleno SIN respaldo sector a sector (--no-backup) — lo pedido por el autor es respaldar siempre"),
+    }
+
+    let fopts = fill::FillOptions {
+        start: start as u64,
+        end: end as u64,
+        block: o.block.max(1),
+        allow_zeros: o.allow_zeros,
+        backup: backup_path,
+        save_every_ops: fill::FILL_SAVE_EVERY_OPS,
+    };
+    let t0 = Instant::now();
+    let mut last_line = Instant::now();
+    let rep = match fill::run_fill(
+        &mut donor,
+        &mut img,
+        &mut map,
+        dmap.as_ref(),
+        &fopts,
+        &map_path,
+        |p: &fill::FillProgress| {
+            if last_line.elapsed().as_secs() >= 30 {
+                last_line = Instant::now();
+                println!(
+                    "── [relleno] sector {} · llenados {} · ceros omitidos {} · sin donante {} · pendientes {} · {}",
+                    p.cur,
+                    p.filled,
+                    p.zero_skipped,
+                    p.donor_missing,
+                    p.pending,
+                    format_hms(t0.elapsed().as_secs())
+                );
+            }
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error durante el relleno: {e}");
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                eprintln!("  el mapa quedó guardado en {}", map_path.display());
+            }
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(x) = &o.export_map {
+        match map.export_text(x) {
+            Ok(()) => println!("mapa de texto exportado a {}", x.display()),
+            Err(e) => eprintln!("aviso: no se pudo exportar el mapa de texto: {e}"),
+        }
+    }
+    println!("relleno terminado en {}", format_hms(rep.seconds));
+    println!(
+        "  llenados desde el donante: {}  ceros omitidos: {}  sin dato en el donante: {}  lecturas fallidas del donante: {}",
+        rep.filled, rep.zero_skipped, rep.donor_missing, rep.donor_errors
+    );
+    let (g, f, s, u) = map.stats();
+    println!(
+        "  imagen ahora: {} buenos · {} pendientes",
+        g,
+        f + s + u
+    );
     ExitCode::SUCCESS
 }
 
@@ -1523,6 +1752,9 @@ mod tests {
             no_backup: false,
             export_map: None,
             import_map: None,
+            fill_from: None,
+            donor_map: None,
+            allow_zeros: false,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
@@ -1750,5 +1982,23 @@ mod tests {
             assert!(l.chars().count() <= 71, "línea de {}: {l}", l.chars().count());
         }
         assert!(w.replace('\n', " ").contains("--merge."));
+    }
+
+    #[test]
+    fn cli_parse_modo_relleno() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        // parse_common recibe args[1..]: el primer token es la imagen posicional.
+        let o = parse_common(&s(&[
+            "img.raw",
+            "--fill-from",
+            "don.img",
+            "--donor-map",
+            "d.log",
+            "--allow-zeros",
+        ]));
+        assert_eq!(o.fill_from.as_deref(), Some(Path::new("don.img")));
+        assert_eq!(o.donor_map.as_deref(), Some(Path::new("d.log")));
+        assert!(o.allow_zeros);
+        assert_eq!(o.image.as_deref(), Some(Path::new("img.raw")));
     }
 }

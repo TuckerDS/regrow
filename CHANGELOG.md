@@ -33,6 +33,15 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 - `surfmap` puede dibujar el estado completo desde un mapfile de texto
   (`surfmap --import-map mapa.log --sectors N`): mapa rescatado/pendiente/
   rascado con tooltips por celda y tabla de los tramos pendientes más grandes.
+  Con ventana de zoom (`--start A --end B`) dibuja un clúster a resolución de
+  megabytes y lista todos sus tramos con los sectores exactos.
+- `rescue --fill-from <donante>`: relleno aditivo de los huecos pendientes de
+  una imagen desde una segunda copia del origen (archivo). Con `--donor-map`
+  solo se copia lo que el mapa del donante certifica como bueno; sin mapa del
+  donante se filtran los sectores todo-cero (un hueco y un cero son
+  indistinguibles en un archivo), con `--allow-zeros` como excepción explícita.
+  Mismas protecciones que el rescate: respaldo sidecar previo, mapfile
+  atómico, y los tramos ya buenos de la imagen jamás se reescriben.
 - Línea de estado periódica también cuando no hay terminal.
 
 ### Fixed
