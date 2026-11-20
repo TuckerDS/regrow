@@ -716,6 +716,8 @@ mod tests {
             retry_wait: 2,
             reverse: true,
             map_path: None,
+            backup_file: None,
+            no_backup: false,
             export_map: None,
             import_map: None,
             sectors: None,

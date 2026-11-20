@@ -81,6 +81,8 @@ pub struct CommonOpts {
     pub retry_wait: u64,             // segundos de descanso entre reintentos/bloque fallido
     pub reverse: bool,               // pasada inversa (activa por defecto)
     pub map_path: Option<PathBuf>,   // mapfile propio (def: <imagen-destino>.map)
+    pub backup_file: Option<PathBuf>, // sidecar de respaldo (def: <imagen-destino>.respaldo)
+    pub no_backup: bool,             // desactivar el respaldo (no recomendado)
     pub export_map: Option<PathBuf>, // exportar además el mapa en texto
     pub import_map: Option<PathBuf>, // continuar desde un mapfile de texto ajeno
     // Mapa de superficie (surfmap):
@@ -124,6 +126,9 @@ fn usage() -> ! {
          \x20 --retry N          (rescue) tentativas por sector fallido en el rascado (def 3)\n\
          \x20 --retry-wait S     (rescue) segundos de descanso entre reintentos y tras bloque\n\
          \x20                    fallido (def 2; 0 = sin pausas) — en campo: más pausa, menos daño\n\
+         \x20 --backup-file R    (rescue) sidecar donde respaldar cada sector antes de\n\
+         \x20                    sobrescribirlo (def: <imagen>.respaldo)\n\
+         \x20 --no-backup        (rescue) desactivar el respaldo — no recomendado\n\
          \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
          \x20 --map F            (rescue) mapfile propio (def: <imagen-destino>.map)\n\
          \x20 --export-map F     (rescue) exportar además el mapa en texto compatible\n\
@@ -226,6 +231,8 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         retry_wait: 2,
         reverse: true,
         map_path: None,
+        backup_file: None,
+        no_backup: false,
         export_map: None,
         import_map: None,
         sectors: None,
@@ -255,8 +262,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--raw" => o.raw = Some(take_num(args, &mut i, "--raw") as u32),
             "--dev" => o.dev = Some(take_path(args, &mut i, "--dev")),
             "--log-dir" => o.log_dir = take_path(args, &mut i, "--log-dir"),
-            "--backup" => o.backup_dir = Some(take_path(args, &mut i, "--backup")),
-            "--no-log" => o.no_log = true,
+            "--backup" => o.backup_dir = Some(take_path(args, &mut i, "--backup")),            "--no-log" => o.no_log = true,
             "--merge" => o.merge = true,
             "--allow-data-loss" => o.allow_data_loss = true,
             "--prescan" => o.prescan = true,
@@ -267,6 +273,8 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--retry-wait" => o.retry_wait = take_num(args, &mut i, "--retry-wait").clamp(0, 3600),
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
+            "--backup-file" => o.backup_file = Some(take_path(args, &mut i, "--backup-file")),
+            "--no-backup" => o.no_backup = true,
             "--export-map" => o.export_map = Some(take_path(args, &mut i, "--export-map")),
             "--import-map" => o.import_map = Some(take_path(args, &mut i, "--import-map")),
             "--sectors" => o.sectors = Some(take_num(args, &mut i, "--sectors")),
@@ -578,7 +586,23 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         retry_wait: Duration::from_secs(o.retry_wait),
         max_temp: o.max_temp,
         device: dev.clone(),
+        backup: if o.no_backup {
+            None
+        } else {
+            Some(o.backup_file.clone().unwrap_or_else(|| {
+                let mut s = dest.to_string_lossy().into_owned();
+                s.push_str(".respaldo");
+                PathBuf::from(s)
+            }))
+        },
     };
+    match &ropts.backup {
+        Some(p) => println!(
+            "respaldo sector a sector: cada sector de la imagen se guarda en {} ANTES de sobrescribirlo",
+            p.display()
+        ),
+        None => println!("aviso: rescate SIN respaldo sector a sector (--no-backup) — lo pedido por el autor es respaldar siempre"),
+    }
     let t0 = Instant::now();
     let mut last_line = Instant::now();
     let rep = match rescue::run_rescue(&mut *src, &mut img, &mut map, &ropts, &map_path, |p: &rescue::Progress| {
@@ -1456,6 +1480,8 @@ mod tests {
             retry_wait: 2,
             reverse: true,
             map_path: None,
+            backup_file: None,
+            no_backup: false,
             export_map: None,
             import_map: None,
             sectors: None,
