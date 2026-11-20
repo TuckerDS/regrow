@@ -52,12 +52,25 @@ pub enum RunMode {
     /// banda) o problemáticos; ilegibles con la semántica de `repair`.
     Refresh,
     Regenerate, // rango completo, incluso sectores sanos
+    /// Battery multi-patrón (estilo badblocks): escribe 0x00/0xAA/0x55/0xFF,
+    /// releídos y comparados uno a uno, y al final restaura el contenido
+    /// original (verificado). Discrimina fallo de lectura, fallo de ESCRITURA
+    /// (`W`) y sectores marginales sensibles al patrón (`M`). Con tramos del
+    /// mapa (`--import-map`) es quirúrgica: sidecar y registro como `repair`;
+    /// en rango completo no respalda lo sano y exige consentimiento explícito
+    /// (la puerta vive en el CLI).
+    TestWrite,
 }
 
 /// Umbrales de latencia en ms, estrictamente crecientes :
 /// clasifican las lecturas lentas en bandas T1..T4. `bands[3]` es el umbral
 /// de retardo (T4) y coincide con `EngineOptions.delay`.
 pub const DEFAULT_LATENCY_BANDS: [u64; 4] = [5, 20, 50, DEFAULT_DELAY_MS];
+
+/// Patrones de la battery `TestWrite`, en el orden canónico de las pruebas de
+/// superficie: todo-ceros, 0101… (máxima densidad de transiciones), 1010… y
+/// todo-unos (peor caso de bias DC).
+pub const TEST_PATTERNS: [u8; 4] = [0x00, 0xAA, 0x55, 0xFF];
 
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
@@ -187,6 +200,10 @@ pub struct EngineStats {
     pub data_lost: u64, // ilegibles reescritos con ceros (allow_data_loss)
     pub backed_up: u64, // contenidos respaldados antes de reescribir
     pub healthy_skipped: u64, // sectores sanos saltados gracias al prescan
+    // Battery `TestWrite`:
+    pub tested_ok: u64,   // sectores que pasaron la battery ENTERA (4 patrones + restauración)
+    pub marginal: u64,    // sectores marginales: escriben/restauran bien, algún patrón no verifica (M)
+    pub write_fail: u64,  // ruta de escritura fallida en la battery (W)
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +291,8 @@ pub enum Cell {
     Band2, // 'U' banda T2
     Band3, // 'V' banda T3
     Delay, // 'D' banda T4 (retardo clásico)
+    WriteFail, // 'W' battery: escritura fallida
+    Marginal,  // 'M' battery: sensible al patrón
 }
 
 impl Cell {
@@ -287,6 +306,8 @@ impl Cell {
             Cell::Band2 => 'U',
             Cell::Band3 => 'V',
             Cell::Delay => 'D',
+            Cell::WriteFail => 'W',
+            Cell::Marginal => 'M',
         }
     }
 }
@@ -493,7 +514,11 @@ pub fn run<S: SectorSource + ?Sized>(
     // así que se le presta el propio `hooks` y el préstamo termina aquí.
     // Con tramos del mapa NO se prescanea: los tramos YA son la lista corta,
     // y barrer el rango completo contradice el bisturí (no releer lo sano).
-    let pre = if opts.prescan && opts.mode != RunMode::Regenerate && opts.ranges.is_none() {
+    let pre = if opts.prescan
+        && opts.mode != RunMode::Regenerate
+        && opts.mode != RunMode::TestWrite
+        && opts.ranges.is_none()
+    {
         Some(prescan(src, opts, &mut hooks, &mut on_cell))
     } else {
         None
@@ -590,7 +615,7 @@ pub fn run<S: SectorSource + ?Sized>(
                         continue;
                     }
                 }
-                RunMode::Regenerate => unreachable!(),
+                RunMode::Regenerate | RunMode::TestWrite => unreachable!(),
             }
             last_done = cur_u32;
         }
@@ -740,6 +765,117 @@ pub fn run<S: SectorSource + ?Sized>(
                             paint(&mut cells, cell_idx, band_cell(band), &mut on_cell);
                         } else {
                             paint_scan(&mut cells, cell_idx, &mut on_cell);
+                        }
+                    }
+                }
+                RunMode::TestWrite => {
+                    // Battery multi-patrón. Los ilegibles siguen la puerta
+                    // clásica: sin `allow_data_loss` no se escriben.
+                    if read_failed && !opts.allow_data_loss {
+                        stats.bad += 1;
+                        runs.push(cur_u32, Flag::B);
+                        last_bad = cur as i64;
+                        paint(&mut cells, cell_idx, Cell::Bad, &mut on_cell);
+                    } else {
+                        if read_failed {
+                            // La battery sobre un ilegible destruye lo que
+                            // hubiera: solo entra con permiso explícito.
+                            stats.data_lost += 1;
+                        }
+                        // Quirúrgica (tramos del mapa): se respalda cuando hay
+                        // sidecar configurado (`--backup`), igual que `repair`.
+                        // `backup_or_skip` respalda solo si el hook existe: en
+                        // rango completo sin sidecar no se duplica el disco.
+                        let backed = read_failed
+                            || backup_or_skip(
+                                &mut hooks,
+                                &mut buf,
+                                cur_u32,
+                                cell_idx,
+                                &mut cells,
+                                &mut runs,
+                                &mut last_bad,
+                                &mut stats,
+                                &mut on_cell,
+                                true,
+                            );
+                        if backed {
+                            // 1) Battery: patrón → escritura → relectura →
+                            //    comparación byte a byte, cronometrada (una
+                            //    escritura por patrón: los reintentos de
+                            //    conjunto los da el mapa con +1 intento).
+                            let mut passed = 0u32;
+                            let mut write_error = false;
+                            for &p in TEST_PATTERNS.iter() {
+                                let pat = [p; SECTOR_SIZE];
+                                let mut vbuf = [0u8; SECTOR_SIZE];
+                                let t0 = Instant::now();
+                                if src.write_sector(cur, &pat).is_err() {
+                                    write_error = true;
+                                    continue;
+                                }
+                                let ok = src.read_sector(cur, &mut vbuf).is_ok() && vbuf[..] == pat[..];
+                                let band = latency_band(t0.elapsed(), opts.delay, opts.bands);
+                                if band >= 1 {
+                                    count_slow(&mut stats, band);
+                                }
+                                if ok {
+                                    passed += 1;
+                                }
+                            }
+                            // 2) Restaurar el contenido original y verificarlo.
+                            let restore_ok = if read_failed {
+                                true // no había contenido que restaurar
+                            } else {
+                                src.write_sector(cur, &buf).is_ok()
+                                    && {
+                                        let mut vbuf = [0u8; SECTOR_SIZE];
+                                        src.read_sector(cur, &mut vbuf).is_ok()
+                                            && vbuf[..] == buf[..]
+                                    }
+                            };
+                            // 3) Veredicto.
+                            let all_ok = passed == TEST_PATTERNS.len() as u32;
+                            if all_ok && restore_ok {
+                                stats.tested_ok += 1;
+                                if sparse.is_some() {
+                                    stats.recovered += 1;
+                                    runs.push(cur_u32, Flag::R);
+                                    paint(&mut cells, cell_idx, Cell::Rec, &mut on_cell);
+                                } else {
+                                    paint_scan(&mut cells, cell_idx, &mut on_cell);
+                                }
+                            } else if write_error {
+                                // La ESCRITURA misma falló (al menos un
+                                // patrón): ruta de escritura defectuosa.
+                                stats.write_fail += 1;
+                                runs.push(cur_u32, Flag::W);
+                                last_bad = cur as i64;
+                                paint(&mut cells, cell_idx, Cell::WriteFail, &mut on_cell);
+                            } else if !restore_ok
+                                || (read_failed && passed < TEST_PATTERNS.len() as u32)
+                            {
+                                // Escribió pero no pudo dejar verificado el
+                                // contenido original, o era ilegible y ni
+                                // siquiera relectura lo que escribimos: malo, y
+                                // en rango completo sin sidecar además es
+                                // pérdida de dato.
+                                stats.bad += 1;
+                                if sparse.is_none() && !read_failed {
+                                    stats.data_lost += 1;
+                                }
+                                runs.push(cur_u32, Flag::B);
+                                last_bad = cur as i64;
+                                paint(&mut cells, cell_idx, Cell::Bad, &mut on_cell);
+                            } else {
+                                // Escribe y restaura bien, pero algún patrón
+                                // no verifica: sector sensible al contenido
+                                // (sano con SUS datos, sospechoso con otros).
+                                stats.marginal += 1;
+                                runs.push(cur_u32, Flag::M);
+                                last_bad = cur as i64;
+                                paint(&mut cells, cell_idx, Cell::Marginal, &mut on_cell);
+                            }
                         }
                     }
                 }
@@ -1038,6 +1174,10 @@ mod tests {
         attempts: Vec<u64>, // intentos de escritura (incl. fallidos)
         written_bytes: Vec<(u64, u8)>, // contenido recibido en cada escritura efectiva
         noop: Option<u64>,  // hacer write falla en este sector (fallo de medio)
+        // Modelado de contenido para la battery `TestWrite`:
+        content: std::collections::HashMap<u64, [u8; SECTOR_SIZE]>, // lo que hay tras escribir
+        lie: std::collections::HashMap<u64, HashSet<u8>>, // el sector miente al releer
+                                                           // un contenido cuyo byte es `pattern`
     }
 
     impl MockSource {
@@ -1053,6 +1193,8 @@ mod tests {
                 attempts: Vec::new(),
                 written_bytes: Vec::new(),
                 noop: None,
+                content: std::collections::HashMap::new(),
+                lie: std::collections::HashMap::new(),
             }
         }
     }
@@ -1079,6 +1221,15 @@ mod tests {
                     "error de lectura simulado",
                 ));
             }
+            if let Some(c) = self.content.get(&lba) {
+                // El sector conserva lo escrito; miente al releer un contenido
+                // cuyo primer byte está en su lista de patrones adversos.
+                *buf = *c;
+                if self.lie.get(&lba).is_some_and(|pats| pats.contains(&buf[0])) {
+                    buf[1] ^= 0xFF;
+                }
+                return Ok(());
+            }
             buf[0] = lba as u8;
             Ok(())
         }
@@ -1091,6 +1242,7 @@ mod tests {
             self.writes.push(lba);
             self.written.insert(lba);
             self.written_bytes.push((lba, buf[0]));
+            self.content.insert(lba, *buf);
             Ok(())
         }
     }
@@ -1593,5 +1745,101 @@ mod tests {
         assert_eq!(rep.last_sector, last_progress);
         assert!(rep.last_sector < total - 1, "se cortó antes del fin");
         assert!(!rep.records.iter().any(|r| r.flag == crate::log::Flag::L));
+    }
+
+    // ---- Battery multi-patrón (`TestWrite`, M16) ----
+
+    #[test]
+    fn testwrite_quirurgica_pasa_battery_y_anota_r() {
+        let mut src = MockSource::new(10);
+        let mut o = fast_opts(RunMode::TestWrite, 0, 10);
+        o.ranges = Some(vec![(3, 6)]); // solo los sectores 3..=5 son objetivos
+        let rep = run(&mut src, &o, hooks_empty(), collect());
+        assert_eq!(rep.stats.tested_ok, 3);
+        assert_eq!(rep.stats.recovered, 3, "quirúrgica: aprobado = recuperado");
+        assert_eq!(rep.stats.marginal, 0);
+        assert_eq!(rep.stats.write_fail, 0);
+        // 4 patrones + restauración por sector; lo sano fuera de tramos no se toca.
+        assert_eq!(src.writes.len(), 3 * 5);
+        assert!(src.written.contains(&3) && !src.written.contains(&6));
+        assert!(rep.records.iter().any(|r| r.flag == Flag::R && r.sector == 3 && r.run == 3));
+    }
+
+    #[test]
+    fn testwrite_sector_sensitive_al_patron_anota_marginal() {
+        let mut src = MockSource::new(10);
+        // El sector 4 miente al releer el patrón 0xAA: battery incompleta,
+        // pero escribe y restaura su contenido original sin problema.
+        src.lie.insert(4, HashSet::from([0xAA]));
+        let mut o = fast_opts(RunMode::TestWrite, 0, 10);
+        o.ranges = Some(vec![(4, 5)]);
+        let rep = run(&mut src, &o, hooks_empty(), collect());
+        assert_eq!(rep.stats.marginal, 1);
+        assert_eq!(rep.stats.tested_ok, 0);
+        assert_eq!(rep.stats.bad, 0);
+        assert!(rep.records.iter().any(|r| r.flag == Flag::M && r.sector == 4));
+    }
+
+    #[test]
+    fn testwrite_fallo_de_escritura_anota_w() {
+        let mut src = MockSource::new(10);
+        src.noop = Some(5); // la ruta de escritura falla en el sector 5
+        let mut o = fast_opts(RunMode::TestWrite, 0, 10);
+        o.ranges = Some(vec![(4, 6)]);
+        let rep = run(&mut src, &o, hooks_empty(), collect());
+        assert_eq!(rep.stats.write_fail, 1);
+        assert_eq!(rep.stats.tested_ok, 1);
+        assert!(rep.records.iter().any(|r| r.flag == Flag::W && r.sector == 5));
+    }
+
+    #[test]
+    fn testwrite_no_puede_restaurar_es_malo_y_en_rango_completo_pierde_dato() {
+        let mut src = MockSource::new(10);
+        // Miente al releer SU contenido original (byte 4): patrones OK,
+        // restauración verificada fallida.
+        src.lie.insert(4, HashSet::from([0x04]));
+        let rep = run(&mut src, &fast_opts(RunMode::TestWrite, 4, 5), hooks_empty(), collect());
+        assert_eq!(rep.stats.bad, 1);
+        assert_eq!(rep.stats.marginal, 0);
+        assert_eq!(rep.stats.data_lost, 1, "sin sidecar, el contenido quedó destruido");
+        assert!(rep.records.iter().any(|r| r.flag == Flag::B && r.sector == 4));
+    }
+
+    #[test]
+    fn testwrite_ilegible_respetta_la_puerta_de_datos_y_su_battery_es_b() {
+        let mut src = MockSource::new(10);
+        src.broken.insert(5); // escribe pero jamás relectura nada
+        // Sin permiso explícito: ni se intenta la escritura.
+        let mut o = fast_opts(RunMode::TestWrite, 4, 6);
+        o.ranges = Some(vec![(5, 6)]);
+        let rep = run(&mut src, &o, hooks_empty(), collect());
+        assert_eq!(rep.stats.bad, 1);
+        assert!(!src.attempts.contains(&5));
+        // Con permiso: la battery descubre que no relectura → B (no marginal).
+        let mut o2 = fast_opts(RunMode::TestWrite, 4, 6);
+        o2.ranges = Some(vec![(5, 6)]);
+        o2.allow_data_loss = true;
+        let mut src2 = MockSource::new(10);
+        src2.broken.insert(5);
+        let rep2 = run(&mut src2, &o2, hooks_empty(), collect());
+        assert_eq!(rep2.stats.bad, 1);
+        assert_eq!(rep2.stats.marginal, 0);
+        assert_eq!(rep2.stats.data_lost, 1);
+        assert!(rep2.records.iter().any(|r| r.flag == Flag::B && r.sector == 5));
+    }
+
+    #[test]
+    fn testwrite_pendiente_que_relectura_tras_escribir_se_certifica() {
+        let mut src = MockSource::new(10);
+        // Degradado: ilegible hasta escribir; después relectura bien → la
+        // battery completa lo certifica (el caso "pendiente que se remapa").
+        src.degraded.insert(5);
+        let mut o = fast_opts(RunMode::TestWrite, 4, 6);
+        o.ranges = Some(vec![(5, 6)]);
+        o.allow_data_loss = true;
+        let rep = run(&mut src, &o, hooks_empty(), collect());
+        assert_eq!(rep.stats.tested_ok, 1);
+        assert_eq!(rep.stats.recovered, 1);
+        assert!(rep.records.iter().any(|r| r.flag == Flag::R && r.sector == 5));
     }
 }

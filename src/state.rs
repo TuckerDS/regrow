@@ -38,6 +38,7 @@ fn mode_word(m: RunMode) -> &'static str {
         RunMode::Repair => "repair",
         RunMode::Refresh => "refresh",
         RunMode::Regenerate => "regenerate",
+        RunMode::TestWrite => "testwrite",
     }
 }
 
@@ -47,6 +48,7 @@ fn parse_mode(s: &str) -> Option<RunMode> {
         "repair" => Some(RunMode::Repair),
         "refresh" => Some(RunMode::Refresh),
         "regenerate" => Some(RunMode::Regenerate),
+        "testwrite" => Some(RunMode::TestWrite),
         _ => None,
     }
 }
@@ -64,7 +66,8 @@ impl Checkpoint {
              mode={}\r\nunit={}\r\nstart={}\r\nend={}\r\nlast_sector={}\r\n\
              scanned={}\r\nbad={}\r\nrecovered={}\r\ndelays={}\r\n\
              regenerated_ok={}\r\ndata_lost={}\r\nbacked_up={}\r\nhealthy_skipped={}\r\n\
-             slow1={}\r\nslow2={}\r\nslow3={}\r\n",
+             slow1={}\r\nslow2={}\r\nslow3={}\r\n\
+             tested_ok={}\r\nmarginal={}\r\nwrite_fail={}\r\n",
             mode_word(self.mode),
             self.unit,
             self.start,
@@ -81,6 +84,9 @@ impl Checkpoint {
             s.slow1,
             s.slow2,
             s.slow3,
+            s.tested_ok,
+            s.marginal,
+            s.write_fail,
         );
         // Escritura atómica: tempfile + rename (un corte no corrompe el estado).
         let tmp = path.with_extension("state.tmp");
@@ -135,6 +141,9 @@ impl Checkpoint {
                 slow1: kv.get("slow1").copied().unwrap_or(0),
                 slow2: kv.get("slow2").copied().unwrap_or(0),
                 slow3: kv.get("slow3").copied().unwrap_or(0),
+                tested_ok: kv.get("tested_ok").copied().unwrap_or(0),
+                marginal: kv.get("marginal").copied().unwrap_or(0),
+                write_fail: kv.get("write_fail").copied().unwrap_or(0),
             },
         })
     }
@@ -157,6 +166,9 @@ impl Checkpoint {
             slow1: prev.slow1 + cur.slow1,
             slow2: prev.slow2 + cur.slow2,
             slow3: prev.slow3 + cur.slow3,
+            tested_ok: prev.tested_ok + cur.tested_ok,
+            marginal: prev.marginal + cur.marginal,
+            write_fail: prev.write_fail + cur.write_fail,
         }
     }
 }
@@ -396,6 +408,9 @@ mod tests {
                 data_lost: 0,
                 backed_up: 2,
                 healthy_skipped: 0,
+                tested_ok: 5,
+                marginal: 2,
+                write_fail: 1,
             },
             unit: 7,
         };

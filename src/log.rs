@@ -42,6 +42,12 @@ pub enum Flag {
     T,
     U,
     V,
+    // Battery multi-patrón (`testwrite`): W = la RUTA DE ESCRITURA falló
+    // (alguna tentativa de escribir un patrón devolvió error); M = sector
+    // MARGINAL: escribe y restaura bien, pero algún patrón no verifica igual
+    // (el sector es sensible al contenido: sano hoy, sospechoso mañana).
+    W,
+    M,
     // Legacy (solo lectura; regrow NO los escribe):
     A,
     C,
@@ -61,6 +67,8 @@ impl Flag {
             'T' => Some(Flag::T),
             'U' => Some(Flag::U),
             'V' => Some(Flag::V),
+            'W' => Some(Flag::W),
+            'M' => Some(Flag::M),
             'A' => Some(Flag::A),
             'C' => Some(Flag::C),
             'D' => Some(Flag::D),
@@ -80,6 +88,8 @@ impl Flag {
             Flag::T => 'T',
             Flag::U => 'U',
             Flag::V => 'V',
+            Flag::W => 'W',
+            Flag::M => 'M',
             Flag::A => 'A',
             Flag::C => 'C',
             Flag::D => 'D',
