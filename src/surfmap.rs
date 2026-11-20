@@ -215,27 +215,45 @@ fn fmt_gb(sectors: u64) -> String {
 /// mapfile importado de ddrescue es el estado completo del rescate: lo verde
 /// ya está a salvo y ningún rescate lo reescribe; rojo y naranja son el
 /// dominio de trabajo pendiente.
-pub fn render_mapfile(map: &MapFile, cells: usize) -> Result<String, String> {
+/// Renderiza el mapa desde un `MapFile` (dominio = su `sector_count`) dentro
+/// de la ventana `[from, to)`. Con un mapfile importado de ddrescue es el
+/// estado completo del rescate: lo verde ya está a salvo y ningún rescate lo
+/// reescribe; rojo y naranja son el dominio de trabajo pendiente. Ventanas
+/// estrechas (zoom) permiten ver la estructura de un clúster a varios MB por
+/// celda y elegir el tramo de una prueba quirúrgica.
+pub fn render_mapfile(map: &MapFile, cells: usize, from: u64, to: u64) -> Result<String, String> {
     let cells = cells.clamp(16, 8192);
     let total = map.sector_count;
     if total == 0 {
         return Err("el mapfile no tiene dominio".into());
     }
-    let span = (total + cells as u64 - 1) / cells as u64;
+    if from >= to || to > total {
+        return Err(format!("ventana inválida [{from}..{to}) para un dominio de {total}"));
+    }
+    let win = to - from;
+    let span = (win + cells as u64 - 1) / cells as u64;
     let mut worst = vec![MapCell::Untried; cells];
+    // Recuentos DENTRO de la ventana.
     let mut sectors_by = [0u64; 4];
     let mut blocks_by = [0u64; 4];
     let mut problems: Vec<(u64, u64, MapCell)> = Vec::new();
     for e in map.entries() {
+        let ea = e.start;
+        let eb = e.start + e.len;
+        let a = ea.max(from);
+        let b = eb.min(to);
+        if a >= b {
+            continue; // entrada fuera de la ventana
+        }
         let cell = MapCell::of_status(e.status);
-        sectors_by[cell.rank() as usize] += e.len;
+        sectors_by[cell.rank() as usize] += b - a;
         blocks_by[cell.rank() as usize] += 1;
         if cell != MapCell::Good {
-            problems.push((e.start, e.len, cell));
+            problems.push((ea, eb, cell));
         }
-        let a = (e.start / span) as usize;
-        let b = ((e.start + e.len - 1) / span) as usize;
-        for c in a.min(cells - 1)..=b.min(cells - 1) {
+        let ca = ((a - from) / span) as usize;
+        let cb = ((b - 1 - from) / span) as usize;
+        for c in ca.min(cells - 1)..=cb.min(cells - 1) {
             if cell.rank() > worst[c].rank() {
                 worst[c] = cell;
             }
@@ -243,9 +261,11 @@ pub fn render_mapfile(map: &MapFile, cells: usize) -> Result<String, String> {
     }
     // El hueco entre entradas es "sin intentar" (mismo significado que en el
     // propio motor de rescate).
-    let known = sectors_by[0] + sectors_by[1] + sectors_by[2] + sectors_by[3];
-    let untried = total.saturating_sub(known);
-    problems.sort_by_key(|p| std::cmp::Reverse(p.1));
+    let known = sectors_by[1] + sectors_by[2] + sectors_by[3];
+    let untried = win.saturating_sub(known);
+    problems.sort_by_key(|p| p.0);
+    let mut by_size: Vec<(u64, u64, MapCell)> = problems.clone();
+    by_size.sort_by_key(|p| std::cmp::Reverse(p.1 - p.0));
 
     let mut html = String::new();
     html.push_str("<!DOCTYPE html>\n<html lang=\"es\"><head><meta charset=\"utf-8\">\n");
@@ -253,19 +273,22 @@ pub fn render_mapfile(map: &MapFile, cells: usize) -> Result<String, String> {
     html.push_str("body{font-family:sans-serif;background:#101820;color:#dfe6ee;margin:18px}\n");
     html.push_str(".map{display:flex;flex-wrap:wrap;gap:1px;max-width:1000px}\n");
     html.push_str(".c{width:9px;height:9px}\n");
-    html.push_str("table{border-collapse:collapse;margin-top:12px}td{padding:3px 10px;border:1px solid #2c3e50}\n");
+    html.push_str("table{border-collapse:collapse;margin-top:12px}td{padding:2px 10px;border:1px solid #2c3e50;font-size:13px}\n");
     html.push_str("</style></head><body>\n");
     html.push_str(&format!(
-        "<h2>Estado del rescate — {} sectores ({}) en {} celdas ({} sectores/celda)</h2>\n",
-        total,
-        fmt_gb(total),
+        "<h2>Estado del rescate — ventana {}–{} ({}–{}, {}) — {} celdas ({} sectores/celda)</h2>\n",
+        from,
+        to,
+        fmt_gb(from),
+        fmt_gb(to),
+        fmt_gb(win),
         cells,
         span
     ));
     html.push_str("<div class=\"map\">");
     for (i, sev) in worst.iter().enumerate() {
-        let a = i as u64 * span;
-        let b = (a + span).min(total);
+        let a = from + i as u64 * span;
+        let b = (a + span).min(to);
         html.push_str(&format!(
             "<div class=\"c\" style=\"background:{}\" title=\"sectores {}–{} ({}–{}): {}\"></div>",
             sev.css(),
@@ -285,23 +308,40 @@ pub fn render_mapfile(map: &MapFile, cells: usize) -> Result<String, String> {
             sev.label(),
             blocks_by[sev.rank() as usize],
             sec,
-            sec as f64 * 100.0 / total as f64
+            sec as f64 * 100.0 / win as f64
         ));
     }
     html.push_str("</table>\n");
     if !problems.is_empty() {
-        html.push_str("<h3>Mayor dominio pendiente (tramos más grandes)</h3>\n");
+        html.push_str("<h3>Tramos pendientes más grandes (top 10)</h3>\n");
         html.push_str("<table><tr><th>sectores desde–hasta</th><th>tamaño</th><th>estado</th></tr>\n");
-        for (a, len, cell) in problems.iter().take(15) {
+        for (a, b, cell) in by_size.iter().take(10) {
             html.push_str(&format!(
                 "<tr><td>{}–{}</td><td>{} MB</td><td>{}</td></tr>\n",
                 a,
-                a + len,
-                len * 512 / 1_048_576,
+                b,
+                (b - a) * 512 / 1_048_576,
                 cell.label()
             ));
         }
         html.push_str("</table>\n");
+        html.push_str(&format!(
+            "<h3>Todos los tramos pendientes de la ventana, ordenados ({} tramos — útiles para elegir una prueba quirúrgica: --start/--end exactos)</h3>\n",
+            problems.len()
+        ));
+        html.push_str("<table><tr><th>desde</th><th>hasta</th><th>MB</th><th>estado</th></tr>\n");
+        for (a, b, cell) in &problems {
+            html.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{:.2}</td><td>{}</td></tr>\n",
+                a,
+                b,
+                (*b as f64 - *a as f64) * 512.0 / 1_048_576.0,
+                cell.label()
+            ));
+        }
+        html.push_str("</table>\n");
+    } else {
+        html.push_str("<p>Sin tramos pendientes en esta ventana: todo lo que hay aquí está rescatado o sin intentar.</p>\n");
     }
     html.push_str("<p>regrow · verde = ya rescatado (nunca se reescribe); rojo = malo confirmado; naranja = rascado y sigue malo; gris = sin intentar. Pasa el cursor sobre las celdas para ver el rango.</p>\n");
     html.push_str("</body></html>\n");
@@ -355,7 +395,7 @@ mod tests {
         m.set(600, 100, MapStatus::Scraped, 3);
         // 700..1000 sin entradas: quedan como "sin intentar".
         // (16 es el mínimo de celdas: span = ceil(1000/16) = 63 sectores.)
-        let html = render_mapfile(&m, 16).unwrap();
+        let html = render_mapfile(&m, 16, 0, 1000).unwrap();
         let cells: Vec<&str> = html
             .match_indices("style=\"background:")
             .map(|(i, _)| &html[i..i + 40])
@@ -379,12 +419,38 @@ mod tests {
         let mut m = MapFile::new(1000);
         m.set(0, 90, MapStatus::Good, 0);
         m.set(90, 10, MapStatus::Failed, 1);
-        let html = render_mapfile(&m, 16).unwrap();
+        let html = render_mapfile(&m, 16, 0, 1000).unwrap();
         let cells: Vec<&str> = html
             .match_indices("style=\"background:")
             .map(|(i, _)| &html[i..i + 40])
             .collect();
         assert!(cells[0].contains("#2ecc71"), "celda 0 verde (solo Good)");
         assert!(cells[1].contains("#c0392b"), "celda 1 mixta: se pinta con lo peor");
+    }
+
+    #[test]
+    fn zoom_recorta_la_ventana_y_su_tabla() {
+        let mut m = MapFile::new(1000);
+        m.set(0, 480, MapStatus::Good, 0);
+        m.set(480, 20, MapStatus::Failed, 1);
+        m.set(600, 400, MapStatus::Good, 0);
+        // Ventana 0..500 con 16 celdas: span 32; Failed 480..500 pinta la última.
+        let html = render_mapfile(&m, 16, 0, 500).unwrap();
+        let grid: Vec<&str> = html
+            .match_indices("title=\"sectores ")
+            .map(|(i, _)| &html[i - 40..i])
+            .collect();
+        assert_eq!(grid.len(), 16);
+        assert!(grid[0].contains("#2ecc71"), "celda 0 verde");
+        assert!(grid[15].contains("#c0392b"), "celda 15 (480–500) roja");
+        // Ventana alejada del problema: sin rojo en la rejilla y sin tabla.
+        let html2 = render_mapfile(&m, 16, 100, 400).unwrap();
+        let grid2: Vec<&str> = html2
+            .match_indices("title=\"sectores ")
+            .map(|(i, _)| &html2[i - 40..i])
+            .collect();
+        assert_eq!(grid2.len(), 16);
+        assert!(grid2.iter().all(|c| !c.contains("#c0392b")), "nada rojo en la ventana");
+        assert!(html2.contains("Sin tramos pendientes en esta ventana"));
     }
 }

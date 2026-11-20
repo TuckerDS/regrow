@@ -671,7 +671,9 @@ fn cli_surfmap(o: &CommonOpts) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let html = match surfmap::render_mapfile(&map, o.cells) {
+        let from = o.start as u64;
+        let to = o.end.map(|e| e as u64).unwrap_or(total);
+        let html = match surfmap::render_mapfile(&map, o.cells, from, to) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("{e}");
