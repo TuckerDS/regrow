@@ -18,45 +18,53 @@ pub const SURFMAP_DEFAULT_CELLS: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Severity {
-    Bad,   // S / B
-    T4,    // X
-    T3,    // V
-    T2,    // U
-    T1,    // T
-    Rec,   // R
+    WriteFail, // W (battery: la ruta de escritura falló)
+    Bad,       // S / B
+    T4,        // X
+    T3,        // V
+    T2,        // U
+    T1,        // T
+    Marginal,  // M (battery: sensible al patrón)
+    Rec,       // R
     Clean,
 }
 
 impl Severity {
     fn rank(self) -> u8 {
         match self {
-            Severity::Bad => 6,
-            Severity::T4 => 5,
-            Severity::T3 => 4,
-            Severity::T2 => 3,
-            Severity::T1 => 2,
+            Severity::WriteFail => 8,
+            Severity::Bad => 7,
+            Severity::T4 => 6,
+            Severity::T3 => 5,
+            Severity::T2 => 4,
+            Severity::T1 => 3,
+            Severity::Marginal => 2,
             Severity::Rec => 1,
             Severity::Clean => 0,
         }
     }
     fn css(self) -> &'static str {
         match self {
+            Severity::WriteFail => "#8e44ad",
             Severity::Bad => "#c0392b",
             Severity::T4 => "#e67e22",
             Severity::T3 => "#f1c40f",
             Severity::T2 => "#f7dc6f",
             Severity::T1 => "#5dade2",
+            Severity::Marginal => "#16a085",
             Severity::Rec => "#2ecc71",
             Severity::Clean => "#22303c",
         }
     }
     fn label(self) -> &'static str {
         match self {
+            Severity::WriteFail => "fallo de escritura (W)",
             Severity::Bad => "ilegible",
             Severity::T4 => "retardo severo (T4)",
             Severity::T3 => "lento fuerte (T3)",
             Severity::T2 => "lento (T2)",
             Severity::T1 => "muy levemente lento (T1)",
+            Severity::Marginal => "marginal: sensible al patrón (M)",
             Severity::Rec => "recuperado",
             Severity::Clean => "sano / sin datos",
         }
@@ -65,11 +73,13 @@ impl Severity {
 
 fn severity_of(flag: Flag) -> Severity {
     match flag {
+        Flag::W => Severity::WriteFail,
         Flag::S | Flag::B => Severity::Bad,
         Flag::X | Flag::D => Severity::T4,
         Flag::V => Severity::T3,
         Flag::U => Severity::T2,
         Flag::T => Severity::T1,
+        Flag::M => Severity::Marginal,
         Flag::R => Severity::Rec,
         _ => Severity::Clean,
     }
@@ -82,7 +92,7 @@ pub fn render_surfmap(log_bytes: &[u8], total_sectors: u64, cells: usize) -> Res
     let log = DiskLog::parse(log_bytes).map_err(|e| format!("no se puede leer el registro: {e:?}"))?;
     let span = (total_sectors + cells as u64 - 1) / cells as u64;
     let mut worst = vec![Severity::Clean; cells];
-    let mut counts = vec![0u64; 7]; // por flag
+    let mut counts = vec![0u64; 9]; // por severidad (rank 0..8)
     for r in &log.records {
         let sev = severity_of(r.flag);
         if sev == Severity::Clean {
@@ -116,11 +126,13 @@ pub fn render_surfmap(log_bytes: &[u8], total_sectors: u64, cells: usize) -> Res
     }
     html.push_str("</div>\n<table><tr><th>categoría</th><th>registros</th><th>columna</th></tr>\n");
     for sev in [
+        Severity::WriteFail,
         Severity::Bad,
         Severity::T4,
         Severity::T3,
         Severity::T2,
         Severity::T1,
+        Severity::Marginal,
         Severity::Rec,
     ] {
         html.push_str(&format!(

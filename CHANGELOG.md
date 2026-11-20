@@ -8,6 +8,18 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 
 ### Added
 
+- `testwrite`: battery multi-patrón de superficie. Por cada sector objetivo
+  guarda su contenido (sidecar `--backup`), escribe 0x00, 0xAA, 0x55 y 0xFF
+  releyendo y comparando cada patrón, y al final restaura el contenido
+  original verificándolo. Discrimina ilegibles (`B`), ruta de escritura
+  defectuosa (`W`) y sectores MARGINALES (`M`): escriben y restauran bien
+  pero fallan con algún patrón — sanos hoy, sospechosos mañana. Funciona
+  sobre rangos completos o, con `--import-map`, solo sobre los tramos
+  pendientes de un mapa (quirúrgico). Puertas: nunca sobre un dispositivo
+  montado; exige `--backup` o `--allow-data-loss`; en SSD rige el mismo
+  aviso de desgaste que `regenerate`. Los flags `W`/`M` aparecen en
+  `DISKn.LOG`, en el mapa de calor `surfmap` y en el panel vivo.
+
 - `rescue`: rescate disco→imagen por fases (bloques directos con saltos,
   división binaria, rascado sector a sector y pasada inversa). Destino
   disperso; el mapa binario propio (escritura atómica + CRC32) permite

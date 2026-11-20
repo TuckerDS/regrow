@@ -291,9 +291,10 @@ fn run_with(reader: &mut dyn BufRead, o: &CommonOpts) -> ExitCode {
         } else {
             println!("4. Regenerar todos los sectores de un rango (incluso los sanos)");
         }
-        println!("5. Ver estadísticas");
-        println!("6. Salir");
-        let choice = match ask(reader, "Elige [1-6]: ") {
+        println!("5. Battery multipatrón (probar la escritura con 00/AA/55/FF y restaurar el contenido)");
+        println!("6. Ver estadísticas");
+        println!("7. Salir");
+        let choice = match ask(reader, "Elige [1-7]: ") {
             Some(c) => c,
             None => break,
         };
@@ -302,15 +303,16 @@ fn run_with(reader: &mut dyn BufRead, o: &CommonOpts) -> ExitCode {
             "2" => RunMode::Scan,
             "3" => RunMode::Refresh,
             "4" => RunMode::Regenerate,
-            "5" => {
+            "5" => RunMode::TestWrite,
+            "6" => {
                 statistics(reader, &o);
                 continue;
             }
-            "6" => break,
+            "7" => break,
             // Línea vacía: repite el menú sin ruido de error.
             "" => continue,
             _ => {
-                println!("opción inválida (usa 1-6)");
+                println!("opción inválida (usa 1-7)");
                 continue;
             }
         };
@@ -335,6 +337,17 @@ fn run_with(reader: &mut dyn BufRead, o: &CommonOpts) -> ExitCode {
             } else if media == MediaKind::Unknown {
                 println!("No se pudo confirmar el tipo de medio: si fuera un SSD, regenerar desgastaría la NAND sin ningún beneficio.");
             }
+            match ask(reader, "¿Continuar? (y/N): ") {
+                Some(l) if l.trim().eq_ignore_ascii_case("y") => {}
+                _ => continue,
+            }
+        }
+        if mode == RunMode::TestWrite {
+            println!("Battery multipatrón: escribe 0x00, 0xAA, 0x55 y 0xFF en cada sector del rango,");
+            println!("relee y compara cada patrón, y al final restaura el contenido original (verificándolo).");
+            println!("Discrimina ilegibles (B), ruta de escritura mala (W) y sectores marginales (M):");
+            println!("escriben y restauran bien, pero fallan con algún patrón — sanos hoy, sospechosos mañana.");
+            println!("Nunca corre sobre un disco montado; los ilegibles no se escriben sin --allow-data-loss.");
             match ask(reader, "¿Continuar? (y/N): ") {
                 Some(l) if l.trim().eq_ignore_ascii_case("y") => {}
                 _ => continue,

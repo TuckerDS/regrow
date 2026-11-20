@@ -97,7 +97,7 @@ pub struct CommonOpts {
 
 fn usage() -> ! {
     eprintln!(
-        "uso: regrow <scan|repair|refresh|regenerate|prescan|speedtest> <imagen> [opciones]\n\
+        "uso: regrow <scan|repair|refresh|regenerate|testwrite|prescan|speedtest> <imagen> [opciones]\n\
          \x20 regrow <…> --raw N [opciones]\n\
          \x20 regrow <…> --dev PATH [opciones]\n\
          \x20 regrow smart --raw N | --dev PATH\n\
@@ -126,6 +126,10 @@ fn usage() -> ! {
          \x20                    supera C °C (usa smartctl)\n\
          \x20 --ssd-wear-ok      permitir regenerate sobre medio sólido (SSD/NVMe):\n\
          \x20                    reescribir páginas sanas desgasta la NAND sin beneficio\n\
+         \x20 testwrite          battery multi-patrón (00/AA/55/FF + restauración verificada):\n\
+         \x20                    quirúrgica con --import-map (exige --backup o --allow-data-loss);\n\
+         \x20                    en rango completo exige --backup o --allow-data-loss; nunca sobre\n\
+         \x20                    un dispositivo montado. Flags nuevos: W escritura mala, M marginal\n\
          \x20 --block N          (rescue) sectores por bloque de la fase directa (def 128 = 64 KiB)\n\
          \x20 --retry N          (rescue) tentativas por sector fallido en el rascado (def 3)\n\
          \x20 --retry-wait S     (rescue) segundos de descanso entre reintentos y tras bloque\n\
@@ -142,7 +146,7 @@ fn usage() -> ! {
          \x20 --import-map F     (rescue) continuar desde un mapfile de texto ajeno\n\
          \x20                    (rescue: la ruta posicional es la IMAGEN DESTINO sparse;\n\
          \x20                    el origen es SIEMPRE --raw/--dev; --resume retoma no linealmente)\n\
-          \x20                    (scan/repair/refresh/regenerate) PASADA QUIRÚRGICA: la\n\
+          \x20                    (scan/repair/refresh/regenerate/testwrite) PASADA QUIRÚRGICA: la\n\
           \x20                    pasada recorre SOLO los tramos que ese mapa deja\n\
           \x20                    pendientes (lo bueno no se lee ni se escribe) y anota lo\n\
           \x20                    reparado en --map; los tramos quedan en DISKn.ranges y\n\
@@ -429,6 +433,7 @@ pub fn main() -> ExitCode {
         "repair" => cli_pass(&parse_common(&args[1..]), RunMode::Repair),
         "refresh" => cli_pass(&parse_common(&args[1..]), RunMode::Refresh),
         "regenerate" => cli_pass(&parse_common(&args[1..]), RunMode::Regenerate),
+        "testwrite" => cli_pass(&parse_common(&args[1..]), RunMode::TestWrite),
         _ => usage(),
     }
 }
@@ -1146,7 +1151,7 @@ fn build_surgical_plan(
     win: (u32, u32),
 ) -> Result<Option<SurgicalPlan>, ExitCode> {
     let rp = state::ranges_path(&o.log_dir, o.id);
-    let write_mode = matches!(mode, RunMode::Repair | RunMode::Refresh | RunMode::Regenerate);
+    let write_mode = matches!(mode, RunMode::Repair | RunMode::Refresh | RunMode::Regenerate | RunMode::TestWrite);
     let pending_status = [mapfile::MapStatus::Failed, mapfile::MapStatus::Scraped];
 
     // 1) ¿Hay un plan guardado que reanudar?
@@ -1322,7 +1327,7 @@ fn cli_pass(o0: &CommonOpts, mode: RunMode) -> ExitCode {
         }
     }
 
-    let write_mode = matches!(mode, RunMode::Repair | RunMode::Refresh | RunMode::Regenerate);
+    let write_mode = matches!(mode, RunMode::Repair | RunMode::Refresh | RunMode::Regenerate | RunMode::TestWrite);
     let (display, dev_path, mut src) = match open_target(&o, write_mode) {
         Ok(v) => v,
         Err((msg, code)) => {
@@ -1415,6 +1420,7 @@ fn mode_word(mode: RunMode) -> &'static str {
         RunMode::Repair => "REPARACIÓN",
         RunMode::Refresh => "REFRESCO",
         RunMode::Regenerate => "REGENERACIÓN",
+        RunMode::TestWrite => "BATTERY MULTI-PATRÓN",
     }
 }
 
@@ -1441,7 +1447,7 @@ pub(crate) fn gate_regenerate(media: MediaKind, ssd_wear_ok: bool) -> Regate {
     }
 }
 
-/// Coste de desgaste actual de un medio sólido (para el aviso del gate G).
+/// Coste de desgaste actual de un medio sólido (para los avisos de las puertas).
 fn wear_note(si: &smart::SmartInfo) -> String {
     let f = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or_else(|| "?".into());
     format!(
@@ -1452,13 +1458,100 @@ fn wear_note(si: &smart::SmartInfo) -> String {
     )
 }
 
-/// Severidad para agregar celdas al comprimir la barra (Bad manda sobre
-/// Delay/Rec/Scan/Empty; las bandas de latencia se ordenan T1 < T2 < T3 < T4).
+/// Clave del DISCO FÍSICO a partir del nombre de un dispositivo o partición:
+/// `rdisk2`→`disk2`, `disk2s1`→`disk2`, `sda3`→`sda`, `nvme0n1p2`→`nvme0n1`,
+/// `mmcblk0p1`→`mmcblk0`. Se usa para comparar montajes: si una partición de
+/// un disco está montada, escribir patrones en CUALQUIER sector de ese disco
+/// compite con el sistema de archivos.
+pub(crate) fn disk_key(name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let mut k: String = match base.strip_prefix("rdisk") {
+        Some(rest) => format!("disk{rest}"),
+        None => base.to_string(),
+    };
+    loop {
+        // Sufijo de partición con marcador: …sN / …pN (macOS, NVMe, mmc).
+        if let Some(pos) = k.rfind(['s', 'p']) {
+            let suffix = &k[pos + 1..];
+            if !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()) {
+                k.truncate(pos);
+                continue;
+            }
+        }
+        break;
+    }
+    // Discos ATA clásicos: sda3 → sda (la letra de unidad se conserva).
+    if k.starts_with("sd") || k.starts_with("hd") || k.starts_with("vd") {
+        let letters = k.trim_end_matches(|c: char| c.is_ascii_digit());
+        if letters != k && !letters.is_empty() {
+            k = letters.to_string();
+        }
+    }
+    k
+}
+
+/// Tabla de montajes del sistema: (dispositivo, punto de montaje). Linux lee
+/// `/proc/mounts`; macOS consulta `mount -p`. Otros SO devuelven vacío (la
+/// puerta del montaje simplemente no puede demostrar nada ahí).
+fn mount_table() -> Vec<(String, String)> {
+    let parse = |text: &str| -> Vec<(String, String)> {
+        text.lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let dev = it.next()?;
+                // Linux: `dev punto fstype…`; macOS (`mount -p`): `dev on punto…`.
+                let second = it.next()?;
+                let mp = if second == "on" { it.next()? } else { second };
+                Some((dev.to_string(), mp.to_string()))
+            })
+            .collect()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_to_string("/proc/mounts").map(|t| parse(&t)).unwrap_or_default();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("mount").arg("-p").output() {
+            Ok(o) if o.status.success() => parse(&String::from_utf8_lossy(&o.stdout)),
+            _ => Vec::new(),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = parse;
+        Vec::new()
+    }
+}
+
+/// ¿El dispositivo `dev` (o cualquier partición de su disco físico) está
+/// montado? Devuelve el punto de montaje encontrado.
+pub(crate) fn mounted_overlap_with(dev_name: &str, table: &[(String, String)]) -> Option<String> {
+    let key = disk_key(dev_name);
+    for (device, mountpoint) in table {
+        if device == dev_name || (!key.is_empty() && disk_key(device) == key) {
+            return Some(mountpoint.clone());
+        }
+    }
+    None
+}
+
+fn mounted_overlap(dev: &Path) -> Option<String> {
+    // Una ruta tipo /dev/disk/by-partuuid/… se resuelve al nodo real del disco.
+    let real = std::fs::canonicalize(dev).unwrap_or_else(|_| dev.to_path_buf());
+    mounted_overlap_with(&real.to_string_lossy(), &mount_table())
+}
+
+/// Severidad para agregar celdas al comprimir la barra (WriteFail y Bad mandan
+/// sobre Delay/Rec/Scan/Empty; marginal manda sobre las bandas lentas de su
+/// entorno: T1 < marginal < T3 < T4; las bandas se ordenan T1 < T2 < T3 < T4).
 fn cell_rank(c: Cell) -> u8 {
     match c {
-        Cell::Bad => 7,
-        Cell::Delay => 6,
-        Cell::Band3 => 5,
+        Cell::WriteFail => 9,
+        Cell::Bad => 8,
+        Cell::Delay => 7,
+        Cell::Band3 => 6,
+        Cell::Marginal => 5,
         Cell::Band2 => 4,
         Cell::Band1 => 3,
         Cell::Rec => 2,
@@ -1517,7 +1610,12 @@ fn live_rows(
         .min(GRID_CELLS)
         .max(10);
     let bar = fit_bar(cells, bar_w);
-    let danados = stats.bad + stats.recovered;
+    let danados = if mode == RunMode::TestWrite {
+        // En la battery, "dañado" es lo que quedó malo o sospechoso tras la prueba.
+        stats.bad + stats.write_fail + stats.marginal
+    } else {
+        stats.bad + stats.recovered
+    };
     let linea_danados = format!("{danados} sectores dañados detectados");
     let ultima = if mode == RunMode::Scan {
         let bands = stats.slow1 + stats.slow2 + stats.slow3;
@@ -1534,6 +1632,16 @@ fn live_rows(
             paint.yellow(&d)
         } else {
             d
+        }
+    } else if mode == RunMode::TestWrite {
+        let r = format!(
+            "{} superaron la battery · {} marginales · {} escritura mala",
+            stats.tested_ok, stats.marginal, stats.write_fail
+        );
+        if stats.marginal + stats.write_fail > 0 {
+            paint.yellow(&r)
+        } else {
+            paint.cyan(&r)
         }
     } else {
         let r = format!("{} sectores dañados recuperados", stats.recovered);
@@ -1738,6 +1846,58 @@ pub(crate) fn process_run(
         }
     }
 
+    // Puertas de `testwrite` (battery multi-patrón):
+    // 1) JAMÁS sobre un dispositivo montado: la battery reescribe sectores con
+    //    patrones adversarios mientras el sistema de archivos los lee y escribe.
+    // 2) Rango completo toca sectores SANOS: exige consentimiento (sidecar que
+    //    permita restaurar, o permiso explícito de pérdida de datos).
+    // 3) SSD: el mismo gate de desgaste que `regenerate` en rango completo;
+    //    en la quirúrgica solo aviso (el gasto se limita a los pendientes).
+    if mode == RunMode::TestWrite {
+        if let Some(p) = dev_path {
+            if let Some(mp) = mounted_overlap(p) {
+                say(format!(
+                    "Bloqueado: {} participa en el montaje {}; la battery reescribiría sectores mientras el sistema de archivos los usa. Desmóntalo primero o trabaja sobre una imagen.",
+                    p.display(),
+                    mp
+                ));
+                return ExitCode::from(3);
+            }
+        }
+        // Ambas variantes escriben contenido adversario sobre sectores que
+        // pueden guardar dato rescatable: exigen sidecar o consentimiento.
+        if o.backup_dir.is_none() && !o.allow_data_loss {
+            say(String::from(if surgical {
+                "Bloqueado: la battery quirúrgica escribe patrones adversarios sobre los tramos pendientes, que suelen contener dato rescatable. Da --backup DIR (sidecar que permite restaurar) o --allow-data-loss si aceptas la pérdida."
+            } else {
+                "Bloqueado: la battery en rango completo escribe patrones adversarios también sobre sectores sanos. Da --backup DIR (sidecar que permite restaurar) o --allow-data-loss si aceptas la pérdida; o usa --import-map para la versión quirúrgica."
+            }));
+            return ExitCode::from(3);
+        }
+        if !surgical {
+            match gate_regenerate(media, o.ssd_wear_ok) {
+                Regate::Block => {
+                    say(String::from(
+                        "Bloqueado: el medio es sólido (SSD/NVMe); una battery de rango completo gastaría ciclos P/E de toda la NAND sin beneficio magnético. --ssd-wear-ok para continuar con aviso.",
+                    ));
+                    return ExitCode::from(3);
+                }
+                Regate::Warn => {
+                    if media == MediaKind::Ssd {
+                        say(String::from("aviso: battery sobre medio sólido: cada patrón escrito consume ciclos P/E"));
+                    } else {
+                        say(String::from(
+                            "aviso: no se pudo confirmar el tipo de medio; si fuera sólido, la battery gastaría ciclos P/E de la NAND",
+                        ));
+                    }
+                }
+                Regate::Allow => {}
+            }
+        } else if media == MediaKind::Ssd && !o.ssd_wear_ok {
+            say(String::from("aviso: la battery quirúrgica gasta ciclos P/E en los sectores pendientes de este medio sólido"));
+        }
+    }
+
     // Respaldo preventivo.
     let mut backup = match &o.backup_dir {
         Some(d) => match FileBackup::open(d, o.id) {
@@ -1857,8 +2017,13 @@ pub(crate) fn process_run(
                 } else {
                     "?".to_string()
                 };
+                let battery = if mode == RunMode::TestWrite {
+                    format!(" · W {} · M {}", stats.write_fail, stats.marginal)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "── sector {sector} ({pct:.2} %) · T{} U{} V{} X{} · ilegibles {} · {:.1} MB · transcurrido {} · ETA ~{eta}",
+                    "── sector {sector} ({pct:.2} %) · T{} U{} V{} X{} · ilegibles {}{battery} · {:.1} MB · transcurrido {} · ETA ~{eta}",
                     stats.slow1,
                     stats.slow2,
                     stats.slow3,
@@ -1922,7 +2087,10 @@ pub(crate) fn process_run(
                     map.set(r.sector as u64, r.run as u64, mapfile::MapStatus::Good, 0);
                     certified += r.run as u64;
                 }
-                Flag::B => {
+                Flag::B | Flag::W | Flag::M => {
+                    // `W` (escritura mala) y `M` (marginal) siguen pendientes:
+                    // ambos merecen otra tentativa en un pase posterior. La
+                    // clasificación fina vive en DISKn.LOG para los humanos.
                     let s = r.sector as u64;
                     let rt = map.retries_at(s).saturating_add(1);
                     map.set(s, r.run as u64, mapfile::MapStatus::Failed, rt);
@@ -1968,6 +2136,24 @@ pub(crate) fn process_run(
         totals.bad + totals.recovered
     ));
     say(format!("{} sectores dañados recuperados", totals.recovered));
+    if mode == RunMode::TestWrite {
+        say(format!(
+            "{} sectores superaron la battery entera (4 patrones + restauración verificada)",
+            totals.tested_ok
+        ));
+        if totals.marginal > 0 {
+            say(format!(
+                "aviso: {} sectores MARGINALES (M): escriben y restauran bien, pero fallan con algún patrón — sanos hoy, sospechosos mañana",
+                totals.marginal
+            ));
+        }
+        if totals.write_fail > 0 {
+            say(format!(
+                "{} sectores con RUTA DE ESCRITURA mala (W)",
+                totals.write_fail
+            ));
+        }
+    }
     if mode == RunMode::Scan {
         say(format!("{} retardos detectados", totals.delays));
         if totals.slow1 + totals.slow2 + totals.slow3 > 0 {
@@ -2391,5 +2577,107 @@ mod tests {
         assert_eq!(o.donor_map.as_deref(), Some(Path::new("d.log")));
         assert!(o.allow_zeros);
         assert_eq!(o.image.as_deref(), Some(Path::new("img.raw")));
+    }
+
+    // ---- Puertas de `testwrite` y detección de montaje (M16) ----
+
+    #[test]
+    fn disk_key_unifica_disco_y_particiones() {
+        assert_eq!(disk_key("/dev/rdisk2"), "disk2");
+        assert_eq!(disk_key("/dev/disk2"), "disk2");
+        assert_eq!(disk_key("/dev/disk2s1"), "disk2");
+        assert_eq!(disk_key("/dev/sda3"), "sda");
+        assert_eq!(disk_key("/dev/sda"), "sda");
+        assert_eq!(disk_key("/dev/nvme0n1"), "nvme0n1");
+        assert_eq!(disk_key("/dev/nvme0n1p2"), "nvme0n1");
+        assert_eq!(disk_key("/dev/mmcblk0p1"), "mmcblk0");
+    }
+
+    #[test]
+    fn mounted_overlap_detecta_disco_o_cualquier_particion() {
+        let table = vec![
+            ("/dev/disk2s1".to_string(), "/".to_string()),
+            ("/dev/disk3s5".to_string(), "/mnt/extra".to_string()),
+        ];
+        // El disco entero: una de sus particiones montada basta para bloquear.
+        assert_eq!(mounted_overlap_with("/dev/rdisk2", &table).as_deref(), Some("/"));
+        // Otra partición (aunque no esté montada) del mismo disco físico también.
+        assert_eq!(mounted_overlap_with("/dev/disk2s7", &table).as_deref(), Some("/"));
+        assert_eq!(mounted_overlap_with("/dev/rdisk3", &table).as_deref(), Some("/mnt/extra"));
+        // Un disco sin montajes sí deja trabajar.
+        assert_eq!(mounted_overlap_with("/dev/rdisk4", &table), None);
+    }
+
+    /// Imagen de prueba con contenido reconocible (no todo-cero).
+    fn fixture_image(dir: &Path, sectors: u64) -> PathBuf {
+        let p = dir.join("img.raw");
+        let mut data = vec![0u8; (sectors * 512) as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        fs::write(&p, &data).unwrap();
+        p
+    }
+
+    fn tw_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("regrow_tw_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn testwrite_rango_completo_sin_sidecar_ni_permiso_queda_bloqueado() {
+        let dir = tw_dir("full");
+        let img = fixture_image(&dir, 8);
+        let before = fs::read(&img).unwrap();
+        let mut o = opts(&dir, 9, false);
+        o.image = Some(img.clone());
+        let mut src = FileImage::open_rw(&img).unwrap();
+        let code = process_run(&mut src, "img", None, &o, 0, 8, RunMode::TestWrite, None, None);
+        assert_eq!(code, ExitCode::from(3));
+        assert_eq!(fs::read(&img).unwrap(), before, "bloqueado significa NO tocar nada");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn testwrite_quirurgica_sin_sidecar_tambien_queda_bloqueada() {
+        let dir = tw_dir("surg");
+        let img = fixture_image(&dir, 8);
+        let mut o = opts(&dir, 10, false);
+        o.image = Some(img.clone());
+        let plan = SurgicalPlan {
+            ranges: vec![(2, 4)],
+            total: 2,
+            map: None,
+            map_path: dir.join("m.map"),
+            export_path: None,
+            window: (2, 4),
+        };
+        let mut src = FileImage::open_rw(&img).unwrap();
+        let code = process_run(&mut src, "img", None, &o, 0, 8, RunMode::TestWrite, None, Some(plan));
+        assert_eq!(code, ExitCode::from(3));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn testwrite_con_sidecar_escribe_patrones_y_deja_la_imagen_igual() {
+        let dir = tw_dir("ok");
+        let img = fixture_image(&dir, 8);
+        let before = fs::read(&img).unwrap();
+        let mut o = opts(&dir, 11, false);
+        o.image = Some(img.clone());
+        o.backup_dir = Some(dir.join("bk"));
+        let mut src = FileImage::open_rw(&img).unwrap();
+        let code = process_run(&mut src, "img", None, &o, 0, 8, RunMode::TestWrite, None, None);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            fs::read(&img).unwrap(),
+            before,
+            "tras la battery cada sector debe estar como su contenido original"
+        );
+        // El sidecar guarda copia de cada sector reescrito (5 escrituras × 8 sectores).
+        assert!(dir.join("bk").join("DISK11.bak.raw").exists());
+        fs::remove_dir_all(&dir).ok();
     }
 }
