@@ -653,6 +653,43 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
 }
 
 fn cli_surfmap(o: &CommonOpts) -> ExitCode {
+    // Con --import-map el mapa se dibuja desde un mapfile de texto (propio o
+    // de ddrescue) en lugar del registro DISKn.LOG: es el estado completo del
+    // rescate — verde a salvo, rojo/naranja dominio pendiente.
+    if let Some(mp) = &o.import_map {
+        let total = match o.sectors {
+            Some(t) => t,
+            None => {
+                eprintln!("error: --import-map necesita --sectors N (dominio de sectores del mapfile)");
+                return ExitCode::from(2);
+            }
+        };
+        let map = match mapfile::MapFile::import_text(mp, total) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error importando el mapfile: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let html = match surfmap::render_mapfile(&map, o.cells) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        };
+        let out = o.out_path.clone().unwrap_or_else(|| {
+            let mut s = mp.to_string_lossy().into_owned();
+            s.push_str(".surfmap.html");
+            PathBuf::from(s)
+        });
+        if let Err(e) = std::fs::write(&out, html.as_bytes()) {
+            eprintln!("no se puede escribir {}: {e}", out.display());
+            return ExitCode::from(1);
+        }
+        println!("estado del rescate escrito en {} (ábrelo en el navegador)", out.display());
+        return ExitCode::SUCCESS;
+    }
     let total = match o.sectors {
         Some(t) => t,
         None => match load_pending(&o.log_dir, o.id) {
