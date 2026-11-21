@@ -745,6 +745,7 @@ mod tests {
             log_rates: None,
             verify: false,
             timeout_secs: 30,
+            yes: false,
             sectors: None,
             cells: crate::surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,

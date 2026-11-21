@@ -115,6 +115,13 @@ pub trait SectorSource {
     fn supports_direct_verify(&self) -> bool {
         false
     }
+
+    /// Forense ATA de solo lectura (IDENTIFY + READ NATIVE MAX): capacidad
+    /// declarada, Host Protected Area, DCO, AAM/APM. None donde no hay paso
+    /// directo o el medio no coopera — ausencia de información, jamás error.
+    fn ata_forensics(&self) -> Option<crate::ata::AtaForensics> {
+        None
+    }
 }
 
 /// Backend de imagen de archivo (lectura+escritura sobre un .raw).
@@ -246,6 +253,12 @@ pub struct RawDisk {
     /// abrir). Base para la verificación ATA directa y FLUSH CACHE.
     #[allow(dead_code)] // leído solo en la sonda y el cierre (Linux)
     sg_ok: bool,
+    /// El nodo (ya canonicalizado) representa el disco físico completo, no
+    /// una partición. Las órdenes ATA sin LBA de entrada (IDENTIFY, READ
+    /// NATIVE MAX) describen el disco entero: sus resultados solo se muestran
+    /// cuando lo que el usuario abrió también es el disco entero.
+    #[allow(dead_code)] // consumida por la ponta forense (Linux)
+    whole_node: bool,
     /// Verificación ATA directa permitida y en uso: `sg_ok` además de nodo de
     /// disco ENTERO (las órdenes ATA direccionan el disco físico completo; un
     /// mapfile partición-relativo no se corresponde con sus LBA). Se apaga al
@@ -597,6 +610,7 @@ impl RawDisk {
             media,
             synthesized,
             sg_ok: false,
+            whole_node: !looks_like_partition(path),
             verify_direct: false,
             wrote: false,
         };
@@ -606,7 +620,7 @@ impl RawDisk {
         {
             use std::os::unix::io::AsRawFd;
             d.sg_ok = crate::ata::sg_supported(d.file.as_raw_fd());
-            d.verify_direct = d.sg_ok && !looks_like_partition(path);
+            d.verify_direct = d.sg_ok && d.whole_node;
         }
         Ok(d)
     }
@@ -812,6 +826,17 @@ impl SectorSource for RawDisk {
 
     fn supports_direct_verify(&self) -> bool {
         self.verify_direct
+    }
+
+    fn ata_forensics(&self) -> Option<crate::ata::AtaForensics> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            if self.sg_ok && self.whole_node {
+                return crate::ata::probe_forensics(self.file.as_raw_fd(), Duration::from_secs(10));
+            }
+        }
+        None
     }
 }
 

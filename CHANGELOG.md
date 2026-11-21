@@ -56,6 +56,18 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 - Al cerrar un dispositivo donde se escribió, además del vaciado del SO se
   envía FLUSH CACHE al propio disco (solo si la sesión escribió de verdad:
   una pasada de puro rescate no le manda ninguna orden).
+- Forense ATA de solo lectura (donde hay paso directo sobre el disco entero):
+  el propio medio se identifica — modelo, firmware, capacidad de usuario y
+  máximo nativo, conjuntos HPA/DCO/AAM/APM y nivel acústico recomendado. El
+  verbo `smart` lo muestra (incluso sin SMART disponible) y las pasadas
+  scan/repair/refresh/regenerate llevan una línea compacta en cabecera. Un
+  Host Protected Area activo se avisa con los sectores ocultos; regrow jamás
+  modifica HPA/DCO ni el configuration overlay.
+- Verbo nuevo `sanitize <block-erase|block-erase-enhanced|crypto-erase|overwrite>`:
+  saneado completo del medio físico, DELEGADO a las herramientas del sistema
+  (smartctl o hdparm en Linux; en macOS/Windows queda documentado, no
+  ejecutado). Doble confirmación obligatoria (--allow-data-loss + teclear
+  SANEAR, o --yes en uso no interactivo) y jamás sobre un disco montado.
 
 ## [0.2.0] - 2026-11-21
 

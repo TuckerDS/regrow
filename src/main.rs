@@ -99,6 +99,7 @@ pub struct CommonOpts {
     // Verificación directa del firmware (prescan/speedtest):
     pub verify: bool,                // --verify: comprobar sin transferir datos
     pub timeout_secs: u64,           // --timeout N: plazo por comando directo (s)
+    pub yes: bool,                   // --yes: segunda confirmación no interactiva (destructivos)
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
     pub cells: usize,         // resolución del mapa (def 1024)
@@ -113,6 +114,12 @@ fn usage() -> ! {
          \x20 regrow <…> --dev PATH [opciones]\n\
          \x20 regrow smart --raw N | --dev PATH\n\
          \x20 regrow selftest <status|short|long|conveyance|abort> --raw N | --dev PATH\n\
+         \x20 regrow sanitize <block-erase|block-erase-enhanced|crypto-erase|overwrite> --raw N | --dev PATH\n\
+         \x20                    saneado completo del medio físico, DELEGADO a las herramientas\n\
+         \x20                    del sistema (puede tardar horas; irreversible). Exige\n\
+         \x20                    --allow-data-loss y segunda confirmación: escribir SANEAR\n\
+         \x20                    cuando se pida, o --yes en uso no interactivo. Jamás sobre\n\
+         \x20                    un disco montado. En macOS/Windows documenta la delegación.\n\
          \x20 regrow rescue <imagen-destino> --raw N | --dev PATH [opciones]\n\
          \x20 regrow surfmap --id N [--log-dir D] [--sectors N] [--cells N] [--out F]\n\
          \x20 regrow menu [imagen|--raw N|--dev PATH] [opciones]\n\
@@ -363,6 +370,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         log_rates: None,
         verify: false,
         timeout_secs: 30,
+        yes: false,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
         out_path: None,
@@ -417,6 +425,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--log-rates" => o.log_rates = Some(take_path(args, &mut i, "--log-rates")),
             "--verify" => o.verify = true,
             "--timeout" => o.timeout_secs = take_num(args, &mut i, "--timeout").clamp(1, 3600),
+            "--yes" => o.yes = true,
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
             "--backup-file" => o.backup_file = Some(take_path(args, &mut i, "--backup-file")),
@@ -549,6 +558,7 @@ pub fn main() -> ExitCode {
         "menu" => menu::run(&parse_common(&args[1..])),
         "smart" => cli_smart(&args[1..]),
         "selftest" => cli_selftest(&args[1..]),
+        "sanitize" => cli_sanitize(&args[1..]),
         "rescue" => cli_rescue(&parse_common(&args[1..])),
         "surfmap" => cli_surfmap(&parse_common(&args[1..])),
         "prescan" => cli_prescan(&parse_common(&args[1..])),
@@ -562,9 +572,74 @@ pub fn main() -> ExitCode {
     }
 }
 
+/// Forense ATA de solo lectura (IDENTIFY + READ NATIVE MAX(48)) para las
+/// cabeceras. `compacto`: una línea (scan/repair); detallado: bloque completo
+/// (verbo smart). Un None significa «este nodo no cuenta», no «el disco está mal».
+pub(crate) fn ata_forensics_lines(src: &dyn SectorSource, compacto: bool) -> Vec<String> {
+    let Some(f) = src.ata_forensics() else {
+        return Vec::new();
+    };
+    let id = &f.identity;
+    let model = if id.model.is_empty() { "desconocido" } else { &id.model };
+    let user = crate::ata::user_sectors(id);
+    let nat_total = f.native_max.map(|m| m + 1);
+    let hpa_txt = match (nat_total, user, f.hpa_active) {
+        (Some(n), Some(u), Some(true)) => format!(
+            "¡HPA ACTIVO! el medio atiende hasta {n} pero expone {u} ({} sectores ocultos)",
+            f.hpa_hidden.unwrap_or(0)
+        ),
+        (Some(n), Some(u), _) => format!("user {u} sectores / nativo {n} sectores"),
+        (Some(n), None, Some(true)) => format!("nativo {n} sectores (área user no declarada)"),
+        (Some(n), None, _) => format!("nativo {n} sectores"),
+        (None, Some(u), _) => format!("user {u} sectores / máximo nativo no reportado"),
+        (None, None, _) => String::from("capacidades no reportadas"),
+    };
+    let mut feats: Vec<&str> = Vec::new();
+    if id.hpa_supported {
+        feats.push("HPA");
+    }
+    if id.dco_supported {
+        feats.push("DCO");
+    }
+    if id.aam_supported {
+        feats.push("AAM");
+    }
+    if id.apm_supported {
+        feats.push("APM");
+    }
+    if compacto {
+        return vec![format!(
+            "forense ATA (solo lectura): {model} · {hpa_txt}{}",
+            if feats.is_empty() {
+                String::new()
+            } else {
+                format!(" · conjuntos {}", feats.join("/"))
+            }
+        )];
+    }
+    let mut out = vec![format!(
+        "identificación ATA directa: modelo={} firmware={}",
+        model,
+        if id.firmware.is_empty() { "desconocido" } else { &id.firmware }
+    )];
+    out.push(format!("  capacidad: {hpa_txt}"));
+    if !feats.is_empty() {
+        out.push(format!("  conjuntos de características declarados: {}", feats.join(", ")));
+    }
+    if let Some(a) = id.aam_recommended {
+        out.push(format!(
+            "  nivel acústico recomendado por el fabricante: {a} (regrow NO ajusta AAM/APM: eso lo delega a smartctl)"
+        ));
+    }
+    out.push(String::from(
+        "  regrow no modifica HPA/DCO ni el configuration overlay: forense puro de lectura",
+    ));
+    out
+}
+
 fn cli_smart(args: &[String]) -> ExitCode {
     let o = parse_common(args);
-    let (_label, dev, _src) = match open_target(&o, false) {
+    let (_label, dev, src) = match open_target(&o, false) {
         Ok(v) => v,
         Err((msg, code)) => {
             eprintln!("{msg}");
@@ -575,9 +650,27 @@ fn cli_smart(args: &[String]) -> ExitCode {
         eprintln!("error: smart requiere un dispositivo (--raw/--dev), no una imagen");
         return ExitCode::from(2);
     };
-    match smart_query(&dev) {
-        Ok(info) => print_status(&info, &dev.display().to_string()),
-        Err(e) => eprintln!("error consultando SMART de {}: {e}", dev.display()),
+    let smart_ok = match smart_query(&dev) {
+        Ok(info) => {
+            print_status(&info, &dev.display().to_string());
+            true
+        }
+        Err(e) => {
+            eprintln!("error consultando SMART de {}: {e}", dev.display());
+            false
+        }
+    };
+    let forense = ata_forensics_lines(&*src, false);
+    if !forense.is_empty() {
+        for line in forense {
+            println!("{line}");
+        }
+    } else if !smart_ok {
+        eprintln!(
+            "y sin SMART tampoco hay paso ATA directo disponible para identificar {}: instale smartctl o use el nodo completo del disco (no una partición).",
+            dev.display()
+        );
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
@@ -642,6 +735,151 @@ fn cli_selftest(args: &[String]) -> ExitCode {
         },
     }
     ExitCode::SUCCESS
+}
+
+/// Saneado completo del medio físico, **delegado** a las herramientas del
+/// sistema: no reinventamos el mecanismo del firmware — smartctl (primera
+/// opción) o hdparm lo invocan con sus garantías. Doble confirmación
+/// obligatoria (`--allow-data-loss` + teclear SANEAR, o `--yes` en uso no
+/// interactivo) y jamás sobre un disco que participa en un montaje. En macOS
+/// y Windows la delegación queda documentada, no ejecutada.
+fn cli_sanitize(args: &[String]) -> ExitCode {
+    let (mode, rest): (String, Vec<String>) = match args.first().map(|s| s.as_str()) {
+        Some(m @ ("block-erase" | "block-erase-enhanced" | "crypto-erase" | "overwrite")) => {
+            (m.to_string(), args[1..].to_vec())
+        }
+        _ => {
+            eprintln!(
+                "error: sanitize pide un modo: block-erase | block-erase-enhanced | crypto-erase | overwrite"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let o = parse_common(&rest);
+    let dev: PathBuf = match (o.dev.clone(), o.raw.map(RawDisk::native_name)) {
+        (Some(p), _) => p,
+        (None, Some(n)) => PathBuf::from(n),
+        (None, None) => {
+            eprintln!(
+                "error: sanitize requiere --dev PATH o --raw N (una imagen no se sanea: se borra el archivo)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(mp) = mounted_overlap(&dev) {
+        eprintln!(
+            "Bloqueado: {} participa en el montaje {}: no se sanea un disco en uso. Desmóntalo primero.",
+            dev.display(),
+            mp
+        );
+        return ExitCode::from(3);
+    }
+    if !o.allow_data_loss {
+        eprintln!(
+            "Bloqueado: sanitize destruye TODO el contenido del medio físico (tablas de particiones incluidas). Si de verdad quieres hacerlo, añade --allow-data-loss y prepara la segunda confirmación."
+        );
+        return ExitCode::from(3);
+    }
+    if o.yes {
+        // Uso no interactivo: la doble autorización son las dos banderas.
+        eprintln!(
+            "sanitize {mode} sobre {}: irreversible, puede tardar horas. --yes + --allow-data-loss aceptados.",
+            dev.display()
+        );
+    } else {
+        println!(
+            "Vas a sanear {} (modo {mode}): irreversible, borra todo el medio físico y puede tardar horas.",
+            dev.display()
+        );
+        println!("Escribe SANEAR y pulsa intro (cualquier otra cosa aborta):");
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                eprintln!("sin terminal no se puede pedir la confirmación tecleada: usa --yes junto con --allow-data-loss.");
+                return ExitCode::from(3);
+            }
+            Ok(_) if line.trim() == "SANEAR" => {}
+            Ok(_) => {
+                eprintln!("confirmación no recibida: nada se saneó, abortado.");
+                return ExitCode::from(3);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let exists = |cmd: &str| {
+            std::process::Command::new(cmd).arg("--version").output().is_ok()
+        };
+        let (tool, tool_args): (String, Vec<String>) = if smart::smart_available() {
+            (
+                "smartctl".to_string(),
+                vec![format!("--sanitize={mode}"), "--yes".to_string(), dev.display().to_string()],
+            )
+        } else if exists("hdparm") {
+            let flag = match mode.as_str() {
+                "block-erase" => "--sanitize-block-erase",
+                "block-erase-enhanced" => "--sanitize-block-erase-enhanced",
+                "crypto-erase" => "--sanitize-crypto-sector",
+                "overwrite" => {
+                    eprintln!("error: el modo overwrite requiere smartctl (hdparm no lo ofrece).");
+                    return ExitCode::from(2);
+                }
+                _ => unreachable!(),
+            };
+            (
+                "hdparm".to_string(),
+                vec![flag.to_string(), "--yes".to_string(), dev.display().to_string()],
+            )
+        } else {
+            eprintln!(
+                "error: ni smartctl ni hdparm disponibles: no hay a quién delegar el saneado ATA."
+            );
+            return ExitCode::from(1);
+        };
+        eprintln!(
+            "delegando en {tool} (modo {mode}) sobre {}… no interrumpas el proceso ni duermas la unidad.",
+            dev.display()
+        );
+        match std::process::Command::new(&tool).args(&tool_args).status() {
+            Ok(st) if st.success() => {
+                println!("saneado delegado a {tool}: completado. Comprueba el resultado con regrow smart --dev {}", dev.display());
+                ExitCode::SUCCESS
+            }
+            Ok(st) => {
+                eprintln!(
+                    "{tool} terminó con código {}: el saneado NO se completó (¿medio congelado? hay que desbloquearlo antes — eso también queda fuera de regrow).",
+                    st.code().unwrap_or(-1)
+                );
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("no se pudo ejecutar {tool}: {e}{}", perm_note(&e));
+                ExitCode::from(1)
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (mode, dev);
+        eprintln!(
+            "en macOS el saneado queda delegado a la herramienta del fabricante del medio, o a diskutil secureErase 0 <disco> (una pasada de reescritura aleatoria; no es el mecanismo nativo ATA). regrow no la invoca."
+        );
+        ExitCode::from(3)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (mode, dev);
+        eprintln!(
+            "en Windows el saneado ATA queda delegado a la herramienta del fabricante del medio; regrow no la invoca."
+        );
+        ExitCode::from(3)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = (mode, dev);
+        eprintln!("este SO no tiene una herramienta delegable de saneado ATA documentada.");
+        ExitCode::from(3)
+    }
 }
 
 fn cli_rescue(o: &CommonOpts) -> ExitCode {
@@ -1943,6 +2181,11 @@ pub(crate) fn process_run(
             String::new()
         },
     ));
+    // Forense ATA de solo lectura (solo donde hay paso directo en disco
+    // entero): capacidad real, área oculta HPA, conjuntos declarados.
+    for line in ata_forensics_lines(src, true) {
+        say(line);
+    }
     if surgical {
         say(format!(
             "pasada quirúrgica: {} ({} sectores); del resto del rango no se lee ni se escribe ni un sector",
@@ -2422,6 +2665,7 @@ mod tests {
             log_rates: None,
             verify: false,
             timeout_secs: 30,
+            yes: false,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
@@ -2591,6 +2835,28 @@ mod tests {
         assert_eq!(o.timeout_secs, 90);
         let o = parse_common(&s(&["prescan", "--verify", "--timeout", "0"]));
         assert_eq!(o.timeout_secs, 1, "el plazo se acota al menos a 1 s");
+    }
+
+    /// sanitize exige modo y destino crudo; sin --allow-data-loss se rechaza
+    /// antes de tocar nada (el dispositivo de prueba no existe a propósito).
+    #[test]
+    fn sanitize_exige_modo_destino_y_permiso() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        assert_eq!(cli_sanitize(&s(&[])), ExitCode::from(2), "falta el modo");
+        assert_eq!(
+            cli_sanitize(&s(&["sin-modo", "--dev", "/dev/x"])),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_sanitize(&s(&["block-erase", "--id", "9"])),
+            ExitCode::from(2),
+            "sin --dev/--raw no hay medio que sanear"
+        );
+        assert_eq!(
+            cli_sanitize(&s(&["block-erase", "--dev", "/dev/regrow-no-existe-zz"])),
+            ExitCode::from(3),
+            "sin --allow-data-loss no se llega ni a pedir confirmación"
+        );
     }
 
     /// La rama de abort del process_run vuelca los records parciales a la
