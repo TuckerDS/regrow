@@ -25,6 +25,11 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   modo que el algoritmo completo les dé otra pasada entera. Encaja después
   de un `repair`/remap sobre el mismo disco: lo que antes no se leía puede
   responder ahora.
+- `rescue --preview [N]`: el estado muestra el hex+ASCII (1..32 líneas,
+  defecto 3) del último sector leído bien — comprobación visual de lo que
+  está saliendo del cabezal, al estilo del `-P` de ddrescue.
+  `rescue --log-rates RUTA`: una línea numérica por cada estado (segundos,
+  sector, buenos, pendientes, bloques, KiB/s), apta para graficar el rescate.
 
 ## [0.2.0] - 2026-11-21
 

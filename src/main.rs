@@ -93,6 +93,8 @@ pub struct CommonOpts {
     pub min_read_rate: rescue::MinRate, // (rescue) umbral de zona lenta en la fase directa
     pub max_error_rate: Option<u64>, // (rescue) aborto si los intentos fallidos superan esta tasa
     pub requeue: bool,               // (rescue) los tramos agotados vuelven a pendientes
+    pub preview: Option<usize>,      // (rescue) avance hex+ASCII en el estado (líneas)
+    pub log_rates: Option<PathBuf>,  // (rescue) registro de ritmo apto para gráficas
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
     pub cells: usize,         // resolución del mapa (def 1024)
@@ -153,6 +155,10 @@ fn usage() -> ! {
          \x20                    fallidos superan B bytes/s sostenidos\n\
          \x20 --requeue          (rescue) al reanudar, los tramos que el mapa daba por\n\
          \x20                    agotados vuelven a pendientes para otra pasada entera\n\
+         \x20 --preview [N]      (rescue) avanzar en pantalla (1..32 líneas, def 3) el\n\
+         \x20                    hex+ASCII del último sector leído bien\n\
+         \x20 --log-rates RUTA   (rescue) registrar el ritmo en un archivo: una línea\n\
+         \x20                    por estado, columnas numéricas aptas para gráficas\n\
          \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
          \x20 --map F            mapfile propio: en rescue el de la imagen\n\
           \x20                    destino (def: <imagen-destino>.map); en las pasadas\n\
@@ -256,6 +262,22 @@ fn take_min_rate(args: &[String], i: &mut usize) -> rescue::MinRate {
     }
 }
 
+/// Avance hex+ASCII del primer sector del último bloque leído bien
+/// (`--preview`), con el estilo del `-P` de ddrescue.
+fn hex_preview(lba: u64, data: &[u8], lines: usize) -> String {
+    let lines = lines.clamp(1, 32);
+    let mut s = format!("  visto en el sector {lba}:\n");
+    for (k, chunk) in data.chunks(16).take(lines).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        s.push_str(&format!("    {:04x}  {:<47}  |{}|\n", k * 16, hex.join(" "), ascii));
+    }
+    s
+}
+
 /// `--latency a,b,c,d`: umbrales de las bandas T1..T4 en ms, estrictamente
 /// crecientes; `off` desactiva la clasificación (los retardos solo cuentan).
 fn latency_error(v: &str) -> ! {
@@ -327,6 +349,8 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         min_read_rate: rescue::MinRate::Off,
         max_error_rate: None,
         requeue: false,
+        preview: None,
+        log_rates: None,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
         out_path: None,
@@ -367,6 +391,18 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--min-read-rate" => o.min_read_rate = take_min_rate(args, &mut i),
             "--max-error-rate" => o.max_error_rate = take_rate(args, &mut i, "--max-error-rate"),
             "--requeue" => o.requeue = true,
+            "--preview" => {
+                let n = if i + 1 < args.len()
+                    && !args[i + 1].starts_with("--")
+                    && args[i + 1].parse::<u64>().is_ok()
+                {
+                    take_num(args, &mut i, "--preview")
+                } else {
+                    3
+                };
+                o.preview = Some(n.clamp(1, 32) as usize);
+            }
+            "--log-rates" => o.log_rates = Some(take_path(args, &mut i, "--log-rates")),
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
             "--backup-file" => o.backup_file = Some(take_path(args, &mut i, "--backup-file")),
@@ -712,6 +748,7 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         rate_limit: o.rate_limit,
         min_read_rate: o.min_read_rate,
         max_error_rate: o.max_error_rate,
+        preview_lines: o.preview.unwrap_or(0),
     };
     match &ropts.backup {
         Some(p) => println!(
@@ -720,11 +757,27 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         ),
         None => println!("aviso: rescate SIN respaldo sector a sector (--no-backup) — lo pedido por el autor es respaldar siempre"),
     }
+    let mut rates_log: Option<fs::File> = o.log_rates.as_ref().and_then(|p| {
+        match fs::OpenOptions::new().create(true).append(true).open(p) {
+            Ok(mut f) => {
+                if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+                    let _ = writeln!(f, "# segundos sector buenos pendientes bloques_ok bloques_err KiBps");
+                }
+                Some(f)
+            }
+            Err(e) => {
+                eprintln!("aviso: no podré escribir el registro de tasas {}: {e}", p.display());
+                None
+            }
+        }
+    });
     let t0 = Instant::now();
     let mut last_line = Instant::now();
     let rep = match rescue::run_rescue(&mut *src, &mut img, &mut map, &ropts, &map_path, |p: &rescue::Progress| {
         if last_line.elapsed().as_secs() >= 30 {
             last_line = Instant::now();
+            let rate_kibs =
+                p.copied_bytes as f64 / (t0.elapsed().as_secs().max(1) as f64) / 1024.0;
             println!(
                 "── [{}] sector {} · buenos {} pendientes {} · bloques {}/{} ok-err · {:.0} KiB/s{} · {}",
                 p.phase.label(),
@@ -733,10 +786,27 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
                 p.pending,
                 p.blocks_ok,
                 p.block_errors,
-                p.copied_bytes as f64 / (t0.elapsed().as_secs().max(1) as f64) / 1024.0,
+                rate_kibs,
                 if p.slow_deferred > 0 { format!(" · lentos {}", p.slow_deferred) } else { String::new() },
                 format_hms(t0.elapsed().as_secs())
             );
+            if let Some((lba, data)) = &p.preview {
+                print!("{}", hex_preview(*lba, data, o.preview.unwrap_or(3)));
+            }
+            if let Some(f) = &mut rates_log {
+                let _ = writeln!(
+                    f,
+                    "{} {} {} {} {} {} {:.1}",
+                    t0.elapsed().as_secs(),
+                    p.cur,
+                    p.good,
+                    p.pending,
+                    p.blocks_ok,
+                    p.block_errors,
+                    rate_kibs
+                );
+                let _ = f.flush();
+            }
         }
     }) {
         Ok(r) => r,
@@ -2370,6 +2440,8 @@ mod tests {
             min_read_rate: rescue::MinRate::Off,
             max_error_rate: None,
             requeue: false,
+            preview: None,
+            log_rates: None,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
@@ -2477,6 +2549,20 @@ mod tests {
         assert_eq!(o.rate_limit, None);
         let o = parse_common(&s(&["x.raw", "--raw", "1", "--requeue"]));
         assert!(o.requeue);
+        let o = parse_common(&s(&["x.raw", "--raw", "1", "--preview"]));
+        assert_eq!(o.preview, Some(3));
+        let o = parse_common(&s(&["x.raw", "--raw", "1", "--preview", "8", "--log-rates", "ritmos.dat"]));
+        assert_eq!(o.preview, Some(8));
+        assert_eq!(o.log_rates, Some(PathBuf::from("ritmos.dat")));
+    }
+
+    #[test]
+    fn hex_preview_estilo_ddrescue() {
+        let data = b"Hola mundo!\0\0\0\0\0\0";
+        let s = hex_preview(7, data, 1);
+        assert!(s.contains("sector 7"), "{s}");
+        assert!(s.contains("48 6f 6c 61 20 6d 75 6e 64 6f 21 00"), "{s}");
+        assert!(s.contains("|Hola mundo!.....|"), "{s}");
     }
 
     /// --latency parsea cuatro umbrales crecientes; 'off'

@@ -100,6 +100,8 @@ pub struct RescueOptions {
     /// tasa (bytes/s en ventana de 1 s), el rescate se detiene con el
     /// mapfile guardado. None = desactivado.
     pub max_error_rate: Option<u64>,
+    /// Muestra un avance hex+ASCII del último sector leído bien (0 = off).
+    pub preview_lines: usize,
 }
 
 impl Default for RescueOptions {
@@ -118,6 +120,7 @@ impl Default for RescueOptions {
             rate_limit: None,
             min_read_rate: MinRate::Off,
             max_error_rate: None,
+            preview_lines: 0,
         }
     }
 }
@@ -148,6 +151,8 @@ pub struct Progress {
     /// Bytes efectivamente copiados a la imagen en esta corrida (para el ritmo).
     pub copied_bytes: u64,
     pub slow_deferred: u64,
+    /// Primer sector del último bloque leído/copiado bien: (lba, 512 bytes).
+    pub preview: Option<(u64, Vec<u8>)>,
 }
 
 /// Crea (o valida) la imagen sparse: tamaño exacto del origen para que el
@@ -334,6 +339,7 @@ fn emit_progress<F: FnMut(&Progress)>(
     block_errors: u64,
     copied_bytes: u64,
     slow_deferred: u64,
+    preview: Option<&(u64, Vec<u8>)>,
 ) {
     let (g, f, s, u) = map.stats();
     on_progress(&Progress {
@@ -345,6 +351,7 @@ fn emit_progress<F: FnMut(&Progress)>(
         block_errors,
         copied_bytes,
         slow_deferred,
+        preview: preview.cloned(),
     });
 }
 
@@ -366,6 +373,7 @@ pub fn run_rescue(
     let mut last_temp = Instant::now();
     let mut copied_bytes = 0u64;
     let mut slow_deferred = 0u64;
+    let mut last_sample: Option<(u64, Vec<u8>)> = None;
 
     // El respaldo se abre ANTES de tocar nada: si no se puede crear el
     // sidecar, el rescate ni siquiera empieza.
@@ -479,6 +487,9 @@ pub fn run_rescue(
                     map.set(pos, n as u64, MapStatus::Good, 0);
                     blocks_ok += 1;
                     copied_bytes += n as u64 * SECTOR_SIZE as u64;
+                    if opts.preview_lines > 0 {
+                        last_sample = Some((pos, buf[..SECTOR_SIZE].to_vec()));
+                    }
                     if let Some(t) = throttle.as_mut() {
                         if let Some(d) = t.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
                             thread::sleep(d);
@@ -513,7 +524,7 @@ pub fn run_rescue(
             }
             pos += n as u64;
             maybe_save(map, &mut ops, &mut last_save)?;
-            emit_progress(map, &mut on_progress, Phase::Direct, pos, blocks_ok, block_errors, copied_bytes, slow_deferred);
+            emit_progress(map, &mut on_progress, Phase::Direct, pos, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
         }
     }
     map.save(map_path)?;
@@ -540,6 +551,9 @@ pub fn run_rescue(
                         map.set(sa, sl, MapStatus::Good, 0);
                         blocks_ok += 1;
                         copied_bytes += sl * SECTOR_SIZE as u64;
+                        if opts.preview_lines > 0 {
+                            last_sample = Some((sa, buf[..SECTOR_SIZE].to_vec()));
+                        }
                         if let Some(t) = throttle.as_mut() {
                             if let Some(d) = t.feed(Instant::now(), sl * SECTOR_SIZE as u64) {
                                 thread::sleep(d);
@@ -564,7 +578,7 @@ pub fn run_rescue(
                     }
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
-                emit_progress(map, &mut on_progress, Phase::Split, sa + sl, blocks_ok, block_errors, copied_bytes, slow_deferred);
+                emit_progress(map, &mut on_progress, Phase::Split, sa + sl, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
             }
         }
     }
@@ -587,6 +601,9 @@ pub fn run_rescue(
                         map.set(lba, 1, MapStatus::Good, attempt - 1);
                         blocks_ok += 1;
                         copied_bytes += SECTOR_SIZE as u64;
+                        if opts.preview_lines > 0 {
+                            last_sample = Some((lba, buf[..SECTOR_SIZE].to_vec()));
+                        }
                         if let Some(t) = throttle.as_mut() {
                             if let Some(d) = t.feed(Instant::now(), SECTOR_SIZE as u64) {
                                 thread::sleep(d);
@@ -620,7 +637,7 @@ pub fn run_rescue(
                 map.set(lba, 1, MapStatus::Scraped, opts.retries.max(1));
             }
             maybe_save(map, &mut ops, &mut last_save)?;
-            emit_progress(map, &mut on_progress, Phase::Scrape, lba, blocks_ok, block_errors, copied_bytes, slow_deferred);
+            emit_progress(map, &mut on_progress, Phase::Scrape, lba, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
         }
     map.save(map_path)?;
 
@@ -637,6 +654,9 @@ pub fn run_rescue(
                         map.set(pos_ex, n as u64, MapStatus::Good, 0);
                         blocks_ok += 1;
                         copied_bytes += n as u64 * SECTOR_SIZE as u64;
+                        if opts.preview_lines > 0 {
+                            last_sample = Some((pos_ex, buf[..SECTOR_SIZE].to_vec()));
+                        }
                         if let Some(t) = throttle.as_mut() {
                             if let Some(d) = t.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
                                 thread::sleep(d);
@@ -660,7 +680,7 @@ pub fn run_rescue(
                     }
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
-                emit_progress(map, &mut on_progress, Phase::Reverse, pos_ex, blocks_ok, block_errors, copied_bytes, slow_deferred);
+                emit_progress(map, &mut on_progress, Phase::Reverse, pos_ex, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
             }
         }
     }
@@ -780,6 +800,7 @@ mod tests {
             rate_limit: None,
             min_read_rate: MinRate::Off,
             max_error_rate: None,
+            preview_lines: 0,
         }
     }
 
@@ -874,6 +895,29 @@ mod tests {
         assert_eq!(rep2.scraped, 0);
         let bytes = fs::read(&img_path).unwrap();
         assert_eq!(bytes[300 * SECTOR_SIZE], MockRescue::byte_for(300));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_lleva_el_ultimo_sector_leido() {
+        let dir = tmpdir("preview");
+        let img_path = dir.join("d.raw");
+        let map_path = dir.join("d.map");
+        let sectors = 128u64;
+        let mut src = MockRescue::new(sectors);
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut map = MapFile::new(sectors);
+        let mut o = opts(sectors, 8, 1, false);
+        o.preview_lines = 2;
+        let mut mostrados: Vec<Option<(u64, Vec<u8>)>> = Vec::new();
+        run_rescue(&mut src, &mut img, &mut map, &o, &map_path, |p| {
+            mostrados.push(p.preview.clone())
+        })
+        .unwrap();
+        let last = mostrados.last().expect("progresos").as_ref().expect("muestra");
+        assert_eq!(last.0, 120, "último bloque directo comenzaba en 120");
+        assert_eq!(last.1.len(), SECTOR_SIZE);
+        assert_eq!(last.1[0], MockRescue::byte_for(120));
         let _ = fs::remove_dir_all(&dir);
     }
 
