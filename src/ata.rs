@@ -709,8 +709,8 @@ mod tests {
     fn status_ata_de_exito_es_drdy_sin_bsy_ni_err() {
         // La comprobación que usa sg_exec (espejo de smartmontools):
         // (status & 0xC1) == 0x40  ⇒ DRDY, !BSY, !ERR.
-        assert_eq!(0x50u8 & 0xc1, 0x40); // DRDY|seek-complete: éxito
-        assert_eq!(0x58u8 & 0xc1, 0x48); // BSY puesto: NO éxito
+        assert_eq!(0x50u8 & 0xc1, 0x40); // DRDY|DSC|seek: éxito
+        assert_eq!(0xd8u8 & 0xc1, 0xc0); // BSY puesto: NO éxito
         assert_eq!(0x51u8 & 0xc1, 0x41); // ERR puesto: NO éxito
     }
 }
