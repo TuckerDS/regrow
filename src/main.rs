@@ -92,6 +92,7 @@ pub struct CommonOpts {
     pub rate_limit: Option<u64>,     // (rescue) techo de bytes/s copiados a la imagen
     pub min_read_rate: rescue::MinRate, // (rescue) umbral de zona lenta en la fase directa
     pub max_error_rate: Option<u64>, // (rescue) aborto si los intentos fallidos superan esta tasa
+    pub requeue: bool,               // (rescue) los tramos agotados vuelven a pendientes
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
     pub cells: usize,         // resolución del mapa (def 1024)
@@ -150,6 +151,8 @@ fn usage() -> ! {
          \x20                    retrabajan las fases lentas, que aceptan lecturas lentas\n\
          \x20 --max-error-rate B (rescue) detener con el mapfile guardado si los intentos\n\
          \x20                    fallidos superan B bytes/s sostenidos\n\
+         \x20 --requeue          (rescue) al reanudar, los tramos que el mapa daba por\n\
+         \x20                    agotados vuelven a pendientes para otra pasada entera\n\
          \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
          \x20 --map F            mapfile propio: en rescue el de la imagen\n\
           \x20                    destino (def: <imagen-destino>.map); en las pasadas\n\
@@ -323,6 +326,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         rate_limit: None,
         min_read_rate: rescue::MinRate::Off,
         max_error_rate: None,
+        requeue: false,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
         out_path: None,
@@ -362,6 +366,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--rate-limit" => o.rate_limit = take_rate(args, &mut i, "--rate-limit"),
             "--min-read-rate" => o.min_read_rate = take_min_rate(args, &mut i),
             "--max-error-rate" => o.max_error_rate = take_rate(args, &mut i, "--max-error-rate"),
+            "--requeue" => o.requeue = true,
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
             "--backup-file" => o.backup_file = Some(take_path(args, &mut i, "--backup-file")),
@@ -672,6 +677,13 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         mapfile::MapFile::new(total)
     };
 
+    if o.requeue {
+        let n = map.requeue_scraped();
+        println!(
+            "requeue: {} sectores que el mapa daba por agotados vuelven a pendientes",
+            n
+        );
+    }
     println!(
         "{display}: {total} sectores; rescate [{}..{end}) → {} (mapfile {})",
         o.start,
@@ -2357,6 +2369,7 @@ mod tests {
             rate_limit: None,
             min_read_rate: rescue::MinRate::Off,
             max_error_rate: None,
+            requeue: false,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
@@ -2462,6 +2475,8 @@ mod tests {
         assert_eq!(o.min_read_rate, rescue::MinRate::Bytes(65536));
         let o = parse_common(&s(&["x.raw", "--raw", "1", "--rate-limit", "off"]));
         assert_eq!(o.rate_limit, None);
+        let o = parse_common(&s(&["x.raw", "--raw", "1", "--requeue"]));
+        assert!(o.requeue);
     }
 
     /// --latency parsea cuatro umbrales crecientes; 'off'

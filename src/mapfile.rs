@@ -223,6 +223,23 @@ impl MapFile {
         out
     }
 
+    /// `--requeue`: los tramos agotados (`Scraped`, el `/` de ddrescue)
+    /// vuelven a pendientes (`Failed`, reintentos a cero) para que el
+    /// algoritmo completo les dé otra pasada entera — útil cuando el medio
+    /// cambió desde la última corrida (p. ej. tras un remap). Devuelve
+    /// cuántos sectores volvieron a pendientes.
+    pub fn requeue_scraped(&mut self) -> u64 {
+        let mut n = 0u64;
+        for e in &mut self.entries {
+            if e.status == MapStatus::Scraped {
+                e.status = MapStatus::Failed;
+                e.retries = 0;
+                n += e.len;
+            }
+        }
+        n
+    }
+
     /// Conteos por estado y total de sectores aún sin mapear.
     pub fn stats(&self) -> (u64, u64, u64, u64) {
         let (mut good, mut failed, mut scraped) = (0u64, 0u64, 0u64);
@@ -463,6 +480,22 @@ mod tests {
         m.set(50, 10, MapStatus::Good, 0);
         assert_eq!(m.entries().len(), 1);
         assert_eq!(m.entries()[0].len, 100);
+    }
+
+    #[test]
+    fn requeue_devuelve_agotados_a_pendientes() {
+        let mut m = MapFile::new(1000);
+        m.set(0, 100, MapStatus::Good, 0);
+        m.set(100, 1, MapStatus::Scraped, 3);
+        m.set(500, 4, MapStatus::Scraped, 2);
+        assert_eq!(m.requeue_scraped(), 5);
+        let (_, failed, scraped, _) = m.stats();
+        assert_eq!((failed, scraped), (5, 0));
+        for e in m.entries().iter().filter(|e| e.status == MapStatus::Failed) {
+            assert_eq!(e.retries, 0, "el reintento se reinicia al reencolar");
+        }
+        // Lo bueno no se toca.
+        assert_eq!(m.stats().0, 100);
     }
 
     #[test]

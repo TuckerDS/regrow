@@ -20,6 +20,11 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   de lectura fallidos superan B bytes/s sostenidos, el rescate se detiene
   con el mapfile guardado. La línea de estado ahora muestra el ritmo
   (KiB/s) y los bloques lentos diferidos; el resumen los contabiliza.
+- `rescue --requeue`: al reanudar, los tramos que el mapa daba por agotados
+  (`/` en ddrescue) vuelven a pendientes con los reintentos reiniciados, de
+  modo que el algoritmo completo les dé otra pasada entera. Encaja después
+  de un `repair`/remap sobre el mismo disco: lo que antes no se leía puede
+  responder ahora.
 
 ## [0.2.0] - 2026-11-21
 

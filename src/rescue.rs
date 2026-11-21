@@ -717,6 +717,9 @@ mod tests {
         fn poison(&mut self, lba: u64) {
             self.never_ok.insert(lba);
         }
+        fn unpoison(&mut self, lba: u64) {
+            self.never_ok.remove(&lba);
+        }
         fn slow(&mut self, lba: u64, ms: u64) {
             self.slow_ms.insert(lba, ms);
         }
@@ -844,6 +847,33 @@ mod tests {
         assert_eq!(loaded.stats().0, 64, "lo sano ya copiado queda Good");
         assert_eq!(loaded.stats().1, 64, "el bloque fallido queda Failed");
         assert_eq!(loaded.stats().3, 1024 - 128, "lo no visitado queda pendiente para --resume");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requeue_reentra_lo_agotado_en_el_resume() {
+        let dir = tmpdir("requeue");
+        let img_path = dir.join("d.raw");
+        let map_path = dir.join("d.map");
+        let sectors = 1024u64;
+        let mut src = MockRescue::new(sectors);
+        src.poison(300);
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut map = MapFile::new(sectors);
+        let o = opts(sectors, 64, 2, false);
+        run_rescue(&mut src, &mut img, &mut map, &o, &map_path, |_| {}).unwrap();
+        let loaded = MapFile::load(&map_path).unwrap();
+        assert_eq!(loaded.stats().2, 1, "el ilegible quedó agotado (Scraped)");
+
+        // El medio "mejora" (como tras un remap): ese sector ya responde.
+        src.unpoison(300);
+        let mut map2 = MapFile::load(&map_path).unwrap();
+        assert_eq!(map2.requeue_scraped(), 1);
+        let rep2 = run_rescue(&mut src, &mut img, &mut map2, &o, &map_path, |_| {}).unwrap();
+        assert_eq!(rep2.good, 1024, "reencolado, el sector se recuperó en la fase directa");
+        assert_eq!(rep2.scraped, 0);
+        let bytes = fs::read(&img_path).unwrap();
+        assert_eq!(bytes[300 * SECTOR_SIZE], MockRescue::byte_for(300));
         let _ = fs::remove_dir_all(&dir);
     }
 
