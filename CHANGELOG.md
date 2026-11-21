@@ -6,6 +6,8 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
 ### Added
 
 - `rescue`: controles de ritmo al estilo ddrescue. `--rate-limit B` techo de

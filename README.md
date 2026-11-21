@@ -60,7 +60,7 @@ utilidades distintas.
 
 ## Estado actual
 
-Versión **0.2.0** — en uso sobre operaciones de recuperación reales.
+Versión **0.3.0** — en uso sobre operaciones de recuperación reales.
 
 | Ya disponible | En camino |
 |---|---|
