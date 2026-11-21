@@ -33,6 +33,13 @@ pub const RESCUE_BLOCK_DEFAULT: usize = 128; // sectores (64 KiB por bloque)
 pub const RESCUE_RETRIES_DEFAULT: u8 = 3;
 pub const RESCUE_SAVE_EVERY_OPS: usize = 128; // guardado del mapa cada N operaciones
 
+/// Umbral a partir del cual un intento de lectura fallido se considera
+/// «laborioso»: el medio tardó en devolver el error, señal de que el cabezal
+/// estuvo aguantando el intento. Solo entonces conviene enfriar (`--retry-wait`).
+/// Un error inmediato declarado por el firmware no necesita pausa: dormirla tras
+/// cada bloque muerto añade horas de sueño puro sin proteger nada.
+const REST_STRAINED: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Direct,
@@ -107,6 +114,10 @@ pub struct RescueOptions {
     /// guardado (`--verify` en `clone`; el `compare` de ddrescue en su forma
     /// más simple). Coste: duplica las lecturas del destino.
     pub verify_dest: bool,
+    /// Salto adaptativo en la fase directa (`--skip-adaptive`): tras una
+    /// ristra de bloques fallidos, salta una distancia geométrica en vez de
+    /// seguir tropezando; lo saltado queda pendiente para las fases lentas.
+    pub skip_adaptive: bool,
 }
 
 impl Default for RescueOptions {
@@ -127,6 +138,7 @@ impl Default for RescueOptions {
             max_error_rate: None,
             preview_lines: 0,
             verify_dest: false,
+            skip_adaptive: false,
         }
     }
 }
@@ -143,6 +155,8 @@ pub struct RescueReport {
     pub block_errors: u64,
     /// Bloques que la fase directa declaró lentos y difirió a las fases lentas.
     pub slow_deferred: u64,
+    /// Saltos adaptativos dados por la fase directa (`--skip-adaptive`).
+    pub adaptive_leaps: u64,
     pub seconds: u64,
 }
 
@@ -182,14 +196,67 @@ pub fn prepare_image(path: &Path, sectors: u64) -> io::Result<FileImage> {
     }
 }
 
+/// `--generate-map`: mapa aproximado a partir de una imagen destino ya
+/// existente (el `-G` de ddrescue, para herencias de `dd`): un sector
+/// TODO-CERO se interpreta como «aún no rescatado» (queda pendiente y se
+/// reintentará desde el origen); cualquier sector con al menos un byte
+/// distinto de cero se da por BUENO y no se releerá del origen.
+/// Advertencia honesta: si un cero era dato legítimo, se releerá del origen
+/// (no se pierde nada); si un no-cero era basura de una imagen ajena, queda
+/// preservado como bueno — usa esta opción solo con imágenes propias de un
+/// rescate o copia fiable.
+pub fn generate_map_from_image(img: &mut FileImage) -> io::Result<MapFile> {
+    let total = img.sector_count();
+    let mut map = MapFile::new(total);
+    const GEN_CHUNK: usize = 1024; // sectores por lectura
+    let mut buf = vec![0u8; GEN_CHUNK * SECTOR_SIZE];
+    let mut run: Option<(u64, u64)> = None; // tramo no-cero en curso
+    let mut pos = 0u64;
+    while pos < total {
+        let n = GEN_CHUNK.min((total - pos) as usize);
+        img.read_chunk(pos, n, &mut buf[..n * SECTOR_SIZE])?;
+        for i in 0..n {
+            let sec = &buf[i * SECTOR_SIZE..(i + 1) * SECTOR_SIZE];
+            let nonzero = sec.iter().any(|&b| b != 0);
+            let lba = pos + i as u64;
+            if nonzero {
+                let continua = match &run {
+                    Some((a, len)) => lba == *a + *len,
+                    None => false,
+                };
+                if continua {
+                    if let Some((_, len)) = &mut run {
+                        *len += 1;
+                    }
+                } else {
+                    if let Some((a, len)) = run.take() {
+                        map.set(a, len, MapStatus::Good, 0);
+                    }
+                    run = Some((lba, 1));
+                }
+            } else if let Some((a, len)) = run.take() {
+                map.set(a, len, MapStatus::Good, 0);
+            }
+        }
+        pos += n as u64;
+    }
+    if let Some((a, len)) = run.take() {
+        map.set(a, len, MapStatus::Good, 0);
+    }
+    Ok(map)
+}
+
 /// Fallo de un intento de rescate. `Read` es un fallo normal del origen (el
 /// sector se reintentará con la lógica de su fase). `Fatal` es un fallo del
 /// respaldo o de la escritura en la imagen: aborta el rescate entero — la
 /// imagen jamás se toca sin su respaldo sector a sector delante.
 enum TryErr {
     /// Fallo de lectura del origen: normal en el rescate (lo reintenta la
-    /// fase correspondiente); se conserva para diagnósticos futuros.
-    Read(#[allow(dead_code)] io::Error),
+    /// fase correspondiente). Lleva el error para diagnósticos y la duración
+    /// real del intento: una lectura que falló al instante (error de medio
+    /// declarado por el firmware) no castiga el cabezal y no necesita pausa;
+    /// una que tardó en fallar sí (el disco estaba aguantando el intento).
+    Read(#[allow(dead_code)] io::Error, Duration),
     /// La lectura terminó bien pero tardó más que el presupuesto de la fase
     /// directa (`--min-read-rate`): el bloque NO se copia ahora; lo retrabajan
     /// las fases lentas. Lleva la tardanza real para el aviso.
@@ -322,7 +389,9 @@ fn try_block(
 ) -> Result<Duration, TryErr> {
     buf.resize(n * SECTOR_SIZE, 0);
     let t = Instant::now();
-    src.read_chunk(lba, n, buf).map_err(TryErr::Read)?;
+    if let Err(e) = src.read_chunk(lba, n, buf) {
+        return Err(TryErr::Read(e, t.elapsed()));
+    }
     let dur = t.elapsed();
     if let Some(bud) = slow_over {
         if dur > bud {
@@ -392,6 +461,10 @@ pub fn run_rescue(
     let mut scratch: Vec<u8> = Vec::new();
     let mut blocks_ok = 0u64;
     let mut block_errors = 0u64;
+    // Salto adaptativo (`--skip-adaptive`): fallos de lectura consecutivos
+    // en la fase directa y la distancia de salto correspondiente.
+    let mut consec_read_fail = 0u64;
+    let mut adaptive_leaps = 0u64;
     let mut ops = 0usize;
     let mut last_save = Instant::now();
     let mut last_temp = Instant::now();
@@ -406,10 +479,16 @@ pub fn run_rescue(
         None => None,
     };
 
-    // Descanso tras cada fallo: en un clúster malo el cabezal agradece pausar.
+    // Descanso tras un fallo laborioso: en un clúster malo el cabezal agradece
+    // pausar, pero solo cuando el medio tardó en fallar (ver REST_STRAINED).
     let rest = |opts: &RescueOptions| {
         if opts.retry_wait > Duration::ZERO {
             thread::sleep(opts.retry_wait.min(Duration::from_secs(30)));
+        }
+    };
+    let rest_after = |opts: &RescueOptions, dur: Duration| {
+        if dur >= REST_STRAINED {
+            rest(opts);
         }
     };
 
@@ -508,6 +587,7 @@ pub fn run_rescue(
             let budget = slow_budget(n, copied_bytes, t0.elapsed());
             match try_block(src, dst, bak.as_mut(), pos, n, &mut buf, &mut scratch, budget, opts.verify_dest) {
                 Ok(_) => {
+                    consec_read_fail = 0;
                     map.set(pos, n as u64, MapStatus::Good, 0);
                     blocks_ok += 1;
                     copied_bytes += n as u64 * SECTOR_SIZE as u64;
@@ -530,16 +610,17 @@ pub fn run_rescue(
                         );
                     }
                 }
-                Err(TryErr::Read(_)) => {
+                Err(TryErr::Read(_, dur)) => {
                     map.set(pos, n as u64, MapStatus::Failed, 0);
                     block_errors += 1;
+                    consec_read_fail += 1;
                     if let Some(m) = errmeter.as_mut() {
                         if m.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
                             map.save(map_path)?;
                             return Err(rate_abort());
                         }
                     }
-                    rest(&opts);
+                    rest_after(&opts, dur);
                 }
                 Err(TryErr::Fatal(e)) => {
                     map.save(map_path)?;
@@ -547,6 +628,29 @@ pub fn run_rescue(
                 }
             }
             pos += n as u64;
+            // Salto adaptativo (`--skip-adaptive`, estilo -K): tras una ristra
+            // de bloques fallidos la fase directa deja de martillar el mismo
+            // clúster — salta una distancia geométrica y lo saltado queda
+            // pendiente para las fases lentas, que sí trabajan sector a
+            // sector. En un clúster malo grande esto ahorra minutos de
+            // tropezar y, sobre todo, castigo adicional al cabezal.
+            if opts.skip_adaptive && consec_read_fail >= 4 {
+                let stride_blocks = 1u64 << (consec_read_fail - 2).min(12);
+                let leap = (stride_blocks as usize).saturating_mul(opts.block.max(1));
+                if pos + (leap as u64) < a + len {
+                    // Lo saltado se declara explícitamente pendiente ( Failed
+                    // cubre también «sin intentar»): así las fases lentas lo
+                    // ven dentro de esta misma corrida, no solo al reanudar.
+                    map.set(pos, leap as u64, MapStatus::Failed, 0);
+                    pos += leap as u64;
+                    adaptive_leaps += 1;
+                    if leap >= 8 * opts.block.max(1) {
+                        eprintln!(
+                            "salto adaptativo: {leap} sectores pendientes se dejan para las fases lentas (el cabezal deja de martillar el clúster)"
+                        );
+                    }
+                }
+            }
             maybe_save(map, &mut ops, &mut last_save)?;
             emit_progress(map, &mut on_progress, Phase::Direct, pos, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
         }
@@ -554,70 +658,91 @@ pub fn run_rescue(
     map.save(map_path)?;
 
     // -------------------------------------------------- fase 2: división ----
-    loop {
-        let work: Vec<(u64, u64)> = map
-            .entries()
-            .iter()
-            .filter(|e| e.status == MapStatus::Failed && e.len > 1 && e.start >= opts.start && e.start < opts.end)
-            .map(|e| (e.start, e.len))
-            .collect();
-        if work.is_empty() {
-            break;
-        }
-        for (a, len) in work {
-            let mid = (len / 2).max(1);
-            for (sa, sl) in [(a, mid), (a + mid, len - mid)] {
-                if sl == 0 {
-                    continue;
-                }
-                match try_block(src, dst, bak.as_mut(), sa, sl as usize, &mut buf, &mut scratch, None, opts.verify_dest) {
-                    Ok(_) => {
-                        map.set(sa, sl, MapStatus::Good, 0);
-                        blocks_ok += 1;
-                        copied_bytes += sl * SECTOR_SIZE as u64;
-                        if opts.preview_lines > 0 {
-                            last_sample = Some((sa, buf[..SECTOR_SIZE].to_vec()));
-                        }
-                        if let Some(t) = throttle.as_mut() {
-                            if let Some(d) = t.feed(Instant::now(), sl * SECTOR_SIZE as u64) {
-                                thread::sleep(d);
-                            }
-                        }
-                    }
-                    Err(TryErr::Slow(_)) => unreachable!(), // sin presupuesto en las fases lentas
-                    Err(TryErr::Read(_)) => {
-                        map.set(sa, sl, MapStatus::Failed, 0);
-                        block_errors += 1;
-                        if let Some(m) = errmeter.as_mut() {
-                            if m.feed(Instant::now(), sl * SECTOR_SIZE as u64) {
-                                map.save(map_path)?;
-                                return Err(rate_abort());
-                            }
-                        }
-                        rest(&opts);
-                    }
-                    Err(TryErr::Fatal(e)) => {
-                        map.save(map_path)?;
-                        return Err(e);
-                    }
-                }
-                maybe_save(map, &mut ops, &mut last_save)?;
-                emit_progress(map, &mut on_progress, Phase::Split, sa + sl, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
+    // Bisección ACOTADA: cada tramo pendiente se parte por la mitad hasta medir
+    // un bloque de la fase directa, y cada trozo se intenta UNA sola vez (la
+    // cola guarda el árbol de bisección). Antes esta fase se re-derivaba del
+    // mapa: en un tramo totalmente ilegible las dos mitades fallidas quedaban
+    // `Failed` con los mismos reintentos, el mapa las fusionaba de vuelta al
+    // tramo original y la división repetía la misma bisección INFINITAMENTE —
+    // martilleo puro: horas tropezando el mismo clúster sin recuperar un sector.
+    // Por debajo del tamaño de bloque una lectura bulk ya no ahorra nada frente
+    // a intentar los sectores uno a uno: eso es trabajo del rascado.
+    let floor = opts.block.max(1) as u64;
+    let mut queue: std::collections::VecDeque<(u64, u64)> = map
+        .pending_ranges(opts.start, opts.end, &[MapStatus::Failed])
+        .into_iter()
+        .filter(|(_, len)| *len > floor)
+        .collect();
+    while let Some((a, len)) = queue.pop_front() {
+        let mid = (len / 2).max(1);
+        for (sa, sl) in [(a, mid), (a + mid, len - mid)] {
+            if sl == 0 {
+                continue;
             }
+            match try_block(src, dst, bak.as_mut(), sa, sl as usize, &mut buf, &mut scratch, None, opts.verify_dest) {
+                Ok(_) => {
+                    map.set(sa, sl, MapStatus::Good, 0);
+                    blocks_ok += 1;
+                    copied_bytes += sl * SECTOR_SIZE as u64;
+                    if opts.preview_lines > 0 {
+                        last_sample = Some((sa, buf[..SECTOR_SIZE].to_vec()));
+                    }
+                    if let Some(t) = throttle.as_mut() {
+                        if let Some(d) = t.feed(Instant::now(), sl * SECTOR_SIZE as u64) {
+                            thread::sleep(d);
+                        }
+                    }
+                }
+                Err(TryErr::Slow(_)) => unreachable!(), // sin presupuesto en las fases lentas
+                Err(TryErr::Read(_, dur)) => {
+                    map.set(sa, sl, MapStatus::Failed, 0);
+                    block_errors += 1;
+                    // El trozo sigue midiendo más que un bloque: su bisección
+                    // queda en cola y se intentará una única vez.
+                    if sl > floor {
+                        queue.push_back((sa, sl));
+                    }
+                    if let Some(m) = errmeter.as_mut() {
+                        if m.feed(Instant::now(), sl * SECTOR_SIZE as u64) {
+                            map.save(map_path)?;
+                            return Err(rate_abort());
+                        }
+                    }
+                    rest_after(&opts, dur);
+                }
+                Err(TryErr::Fatal(e)) => {
+                    map.save(map_path)?;
+                    return Err(e);
+                }
+            }
+            maybe_save(map, &mut ops, &mut last_save)?;
+            emit_progress(map, &mut on_progress, Phase::Split, sa + sl, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
         }
     }
     map.save(map_path)?;
 
     // --------------------------------------------------- fase 3: rascado ----
-    // Cada candidato se trabaja UNA vez por pasada (los que agoten los
-    // reintentos quedan `?`; los reintentará de nuevo una próxima pasada).
-    let singles: Vec<u64> = map
-        .entries()
-        .iter()
-        .filter(|e| e.len == 1 && matches!(e.status, MapStatus::Failed | MapStatus::Scraped) && e.start >= opts.start && e.start < opts.end)
-        .map(|e| e.start)
-        .collect();
-    for lba in singles {
+    // Candidatos: TODOS los sectores pendientes (`Failed`, incluidos los huecos
+    // sin mapear) del rango. La división acotada ya buscó los tramos grandes
+    // legibles; lo que queda es saber si hay algo recuperable sector a sector.
+    // Los `Scraped` (agotados en pasadas anteriores) NO se reintentan aquí: para
+    // eso está `--requeue`, que los devuelve explícitamente a pendientes. Cada
+    // candidato se trabaja UNA vez por pasada (los que agoten los reintentos
+    // quedan `?`). Es la fase cara del rescate: cuesta un intento por sector
+    // pendiente, por eso se avisa cuántos son (`--retry` y `--max-error-rate`
+    // son los mandos del coste).
+    let spans: Vec<(u64, u64)> = map.pending_ranges(opts.start, opts.end, &[MapStatus::Failed]);
+    let candidates: u64 = spans.iter().map(|(_, len)| *len).sum();
+    if candidates > 0 {
+        eprintln!(
+            "rascado: {} sectores pendientes se intentan uno a uno ({} tentativa{} cada uno)",
+            candidates,
+            opts.retries.max(1),
+            if opts.retries.max(1) > 1 { "s" } else { "" }
+        );
+    }
+    for (a, len) in spans {
+        for lba in a..a + len {
             let mut recovered = false;
             for attempt in 1..=opts.retries.max(1) {
                 match try_block(src, dst, bak.as_mut(), lba, 1, &mut buf, &mut scratch, None, opts.verify_dest) {
@@ -637,7 +762,7 @@ pub fn run_rescue(
                         break;
                     }
                     Err(TryErr::Slow(_)) => unreachable!(), // sin presupuesto en las fases lentas
-                    Err(TryErr::Read(_)) => {
+                    Err(TryErr::Read(_, dur)) => {
                         map.set(lba, 1, MapStatus::Failed, attempt as u8);
                         block_errors += 1;
                         if let Some(m) = errmeter.as_mut() {
@@ -646,9 +771,13 @@ pub fn run_rescue(
                                 return Err(rate_abort());
                             }
                         }
-                        // pausa entre tentativas del mismo sector (no tras la última)
+                        // Pausa entre tentativas del mismo sector (nunca tras
+                        // la última) y solo si el fallo fue laborioso: un error
+                        // inmediato del firmware no necesita enfriar el medio, y
+                        // dormir tras cada sector muerto multiplicaba el coste
+                        // de un dominio grande por el `--retry-wait`.
                         if attempt < opts.retries.max(1) {
-                            rest(&opts);
+                            rest_after(&opts, dur);
                         }
                     }
                     Err(TryErr::Fatal(e)) => {
@@ -663,6 +792,7 @@ pub fn run_rescue(
             maybe_save(map, &mut ops, &mut last_save)?;
             emit_progress(map, &mut on_progress, Phase::Scrape, lba, blocks_ok, block_errors, copied_bytes, slow_deferred, last_sample.as_ref());
         }
+    }
     map.save(map_path)?;
 
     // ------------------------------------------------ fase 4: pasada inversa --
@@ -688,7 +818,7 @@ pub fn run_rescue(
                         }
                     }
                     Err(TryErr::Slow(_)) => unreachable!(), // sin presupuesto en las fases lentas
-                    Err(TryErr::Read(_)) => {
+                    Err(TryErr::Read(_, dur)) => {
                         block_errors += 1;
                         if let Some(m) = errmeter.as_mut() {
                             if m.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
@@ -696,7 +826,7 @@ pub fn run_rescue(
                                 return Err(rate_abort());
                             }
                         }
-                        rest(&opts);
+                        rest_after(&opts, dur);
                     }
                     Err(TryErr::Fatal(e)) => {
                         map.save(map_path)?;
@@ -719,6 +849,7 @@ pub fn run_rescue(
         blocks_ok,
         block_errors,
         slow_deferred,
+        adaptive_leaps,
         seconds: t0.elapsed().as_secs(),
     })
 }
@@ -826,6 +957,7 @@ mod tests {
             max_error_rate: None,
             preview_lines: 0,
             verify_dest: false,
+            skip_adaptive: false,
         }
     }
 
@@ -1208,6 +1340,166 @@ mod tests {
         let bytes = fs::read(&img_path).unwrap();
         let off = 71 * SECTOR_SIZE;
         assert_eq!(bytes[off], MockRescue::byte_for(71), "el contraste no altera lo copiado");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ----------------------- U8: --generate-map / --skip-adaptive ----------
+
+    /// `--generate-map` (el `-G` de ddrescue): una imagen ya existente se
+    /// convierte en mapa aproximado — no-cero = bueno, todo-cero = pendiente.
+    #[test]
+    fn generate_map_declara_buenos_los_no_cero_y_deja_los_huecos() {
+        let dir = tmpdir("gen1");
+        let img_path = dir.join("herencia.raw");
+        let sectors = 2_100u64;
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        // Tramos con contenido: 10..30, 1000..1005, 1020..1028 (cruza la
+        // frontera del bloque de lectura de 1024 sectores) y el final 2096..2100.
+        for (a, b) in [(10u64, 30u64), (1000, 1005), (1020, 1028), (2096, 2100)] {
+            let data = vec![0xA5u8; (b - a) as usize * SECTOR_SIZE];
+            img.write_chunk(a, (b - a) as usize, &data).unwrap();
+        }
+        let mut img = FileImage::open_rw(&img_path).unwrap();
+        let map = generate_map_from_image(&mut img).unwrap();
+        let (g, f, s, u) = map.stats();
+        assert_eq!(g, 20 + 5 + 8 + 4, "solo los sectores con contenido cuentan como buenos");
+        assert_eq!(f + s + u, sectors - g, "lo todo-cero queda pendiente");
+        // El tramo que cruza la frontera de lectura es UNA sola entrada: los
+        // tramos no se parten por donde corta nuestro búfer.
+        assert!(
+            map.entries()
+                .iter()
+                .any(|e| e.status == MapStatus::Good && e.start == 1020 && e.len == 8),
+            "el tramo cruzado quedó partido: {:?}",
+            map.entries()
+        );
+        // Los huecos son de verdad huecos (sin entrada): los trabaja la fase directa.
+        assert!(
+            map.entries().iter().all(|e| e.status == MapStatus::Good),
+            "generate_map solo escribe entradas buenas"
+        );
+        assert_eq!(map.pending_ranges(0, sectors, &[MapStatus::Failed]).len(), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Un mapa generado desde la imagen hace que el rescate NO vuelva a leer
+    /// del origen lo que la imagen ya tiene, y complete solo los huecos.
+    #[test]
+    fn generate_map_evita_releer_lo_que_la_imagen_ya_tiene() {
+        let dir = tmpdir("gen2");
+        let sectors = 1_000u64;
+        let src_path = dir.join("origen.raw");
+        let img_path = dir.join("destino.raw");
+        // Origen: 0..500 = 0x11, 500..1000 = 0x22.
+        let mut src_data = vec![0x11u8; 500 * SECTOR_SIZE];
+        src_data.extend(vec![0x22u8; 500 * SECTOR_SIZE]);
+        fs::write(&src_path, &src_data).unwrap();
+        // Imagen heredada: 0..500 = 0xAA (contenido propio), 500..1000 = ceros.
+        let mut img_data = vec![0xAAu8; 500 * SECTOR_SIZE];
+        img_data.extend(vec![0u8; 500 * SECTOR_SIZE]);
+        fs::write(&img_path, &img_data).unwrap();
+
+        let mut src = FileImage::open_ro(&src_path).unwrap();
+        let mut img = FileImage::open_rw(&img_path).unwrap();
+        let mut map = generate_map_from_image(&mut img).unwrap();
+        assert_eq!(map.stats().0, 500);
+        let o = opts(sectors, 64, 1, true);
+        let rep = run_rescue(&mut src, &mut img, &mut map, &o, &dir.join("g.map"), |_| {}).unwrap();
+        assert_eq!(rep.good, sectors);
+        let bytes = fs::read(&img_path).unwrap();
+        // Los 500 primeros conservan lo que la imagen ya guardaba: NO se
+        // releyeron del origen (si se hubieran releído serían 0x11).
+        assert!(bytes[..500 * SECTOR_SIZE].iter().all(|&b| b == 0xAA));
+        // Los huecos todo-cero sí se rellenaron desde el origen.
+        assert!(bytes[500 * SECTOR_SIZE..].iter().all(|&b| b == 0x22));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--skip-adaptive` (estilo `-K`): ante una ristra de bloques fallidos la
+    /// fase directa deja de martillar el clúster y salta. El mapa final y el
+    /// contenido de la imagen son IDÉNTICOS a la corrida sin flag (lo saltado
+    /// lo recupera — o declara imposible — el rascado): el flag cambia el
+    /// coste, nunca el resultado.
+    #[test]
+    fn skip_adaptive_reduce_el_martilleo_sin_alterar_el_resultado() {
+        let sectors = 512u64;
+        let bad: std::collections::HashSet<u64> = (128..256).collect(); // 8 bloques de 16
+
+        let run = |adaptive: bool, tag: &str| {
+            let dir = tmpdir(tag);
+            let img_path = dir.join("d.raw");
+            let mut map = MapFile::new(sectors);
+            let mut src = MockRescue::new(sectors);
+            for l in &bad {
+                src.poison(*l);
+            }
+            let mut img = prepare_image(&img_path, sectors).unwrap();
+            let mut o = opts(sectors, 16, 2, false);
+            o.skip_adaptive = adaptive;
+            let rep = run_rescue(&mut src, &mut img, &mut map, &o, &dir.join("m.map"), |_| {}).unwrap();
+            let bytes = fs::read(&img_path).unwrap();
+            let reads_other = *src.reads_other.borrow();
+            let attempts: usize = src.attempts.borrow().values().sum();
+            let _ = fs::remove_dir_all(&dir);
+            (rep, bytes, reads_other, attempts)
+        };
+
+        let (plain, bytes_plain, reads_plain, attempts_plain) = run(false, "skip0");
+        let (adapt, bytes_adapt, reads_adapt, attempts_adapt) = run(true, "skip1");
+
+        assert!(adapt.adaptive_leaps > 0, "sin saltos el flag no hizo nada");
+        assert_eq!(plain.adaptive_leaps, 0);
+        // Menos bloques tropezados en la fase directa y menos lecturas totales.
+        assert!(
+            adapt.block_errors < plain.block_errors,
+            "esperaba menos intentos fallidos: {} vs {}",
+            adapt.block_errors,
+            plain.block_errors
+        );
+        assert!(
+            attempts_adapt < attempts_plain,
+            "el salto debe ahorrar lecturas: {attempts_adapt} vs {attempts_plain}"
+        );
+        assert!(reads_adapt >= reads_plain, "los sectores sanos se leen igual o más veces");
+        // El resultado final es idéntico: mismos conteos, misma imagen.
+        assert_eq!(adapt.good, plain.good);
+        assert_eq!(adapt.scraped, plain.scraped);
+        assert_eq!(adapt.scraped, bad.len() as u64, "el clúster malo queda rascado");
+        assert_eq!(adapt.good, sectors - bad.len() as u64);
+        assert_eq!(bytes_adapt, bytes_plain, "la imagen no cambia según el flag");
+        for l in &bad {
+            let off = (*l as usize) * SECTOR_SIZE;
+            assert!(bytes_adapt[off..off + SECTOR_SIZE].iter().all(|&b| b == 0));
+        }
+    }
+
+    /// Un clúster totalmente ilegible ya no es un pozo sin fondo: la división
+    /// desciende acotada (hasta el tamaño de bloque) y el rascado cierra la
+    /// pasada intentando los sectores pendientes uno a uno. El rescate TERMINA,
+    /// y su coste es acotado (antes, las dos mitades fallidas se fusionaban en
+    /// el tramo original y la división repetía la misma bisección indefinidamente).
+    #[test]
+    fn un_tramo_totalmente_ilegible_termina_sin_martillar_sin_fin() {
+        let dir = tmpdir("pozo");
+        let sectors = 20_000u64;
+        let mut map = MapFile::new(sectors);
+        let mut src = MockRescue::new(sectors);
+        for l in 4_000u64..14_000u64 {
+            src.poison(l);
+        }
+        let mut img = prepare_image(&dir.join("d.raw"), sectors).unwrap();
+        let o = opts(sectors, 128, 1, false);
+        let rep = run_rescue(&mut src, &mut img, &mut map, &o, &dir.join("m.map"), |_| {}).unwrap();
+        let attempts: u64 = src.attempts.borrow().values().map(|&v| v as u64).sum();
+        // Techo generoso: menos de tres lecturas por sector de TODO el dominio
+        // cuando la mitad está muerta. Un bucle infinito lo reventaría.
+        assert!(
+            attempts < 3 * sectors,
+            "coste fuera de presupuesto: {attempts} intentos para {sectors} sectores"
+        );
+        assert_eq!(rep.scraped, 10_000, "el clúster muerto queda rascado (agotado)");
+        assert_eq!(rep.good, 10_000);
+        assert_eq!(rep.failed, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

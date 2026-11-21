@@ -66,8 +66,15 @@ Versión **0.2.0** — en uso sobre operaciones de recuperación reales.
 |---|---|
 | `scan` / `repair` / `refresh` / `regenerate` / `prescan` / `speedtest` / `smart` / `selftest` | panel TUI interactivo mejorado |
 | `rescue`: disco→imagen por fases (bloques directos, división binaria, rascado sector a sector, pasada inversa) con sidecar de respaldo previo | *file carving* |
-| Mapfile binario propio (atómico, con CRC32) + importación/exportación de mapfiles de texto compatibles con ddrescue | firmas de particiones y sectores de arranque |
-| Pasada quirúrgica `--import-map` en `scan/repair/refresh/regenerate/testwrite`: solo los tramos pendientes, sin releer ni reescribir lo bueno | límite de tasa y requeue estilo ddrescue |
+| Control de ritmo y reanudación del rescate: `--rate-limit`, `--min-read-rate`, `--max-error-rate`, `--requeue`, `--preview`, `--log-rates` | firmas de particiones y sectores de arranque |
+| `rescue --generate-map` (herencias de `dd`: el mapa se deduce de la imagen) y `--skip-adaptive` (salto adaptativo tras bloques fallidos) | operaciones entre mapfiles (fusionar/contrastar dos mapas) |
+| `clone --from PATH --raw N \| --dev PATH`: clonado sector a sector con las fases y el mapfile reanudable del rescate | |
+| `sanitize <modo>`: saneado completo del medio, delegado a las herramientas del sistema y con doble confirmación | |
+| Verificación directa del firmware (`--verify`, `--timeout`): comprueba bloques sin transferir su contenido; donde el medio no la expone, degrada a lecturas normales y lo dice | |
+| Forense ATA de solo lectura (modelo, firmware, máximo nativo, HPA/DCO/AAM/APM) en `smart` y en las cabeceras de las pasadas | |
+| `speedtest --seek`: perfil de tiempos de posicionamiento (media/mediana/p95) con las RPM del medio desde SMART | |
+| Mapfile binario propio (atómico, con CRC32) + importación/exportación de mapfiles de texto compatibles con ddrescue | |
+| Pasada quirúrgica `--import-map` en `scan/repair/refresh/regenerate/testwrite`: solo los tramos pendientes, sin releer ni reescribir lo bueno | |
 | `testwrite`: battery multi-patrón (00/AA/55/FF + restauración verificada) con flags `W` (escritura mala) y `M` (marginal) | |
 | `surfmap`: mapa de superficie HTML (calor sector a sector, zoom, y dibujado desde un mapfile) | |
 | Menú interactivo con panel en vivo; **`regrow` a secas abre el menú** | |

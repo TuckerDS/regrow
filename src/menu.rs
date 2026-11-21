@@ -747,6 +747,8 @@ mod tests {
             verify: false,
             timeout_secs: 30,
             seek: false,
+            generate_map: false,
+            skip_adaptive: false,
             yes: false,
             sectors: None,
             cells: crate::surfmap::SURFMAP_DEFAULT_CELLS,

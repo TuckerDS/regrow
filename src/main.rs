@@ -102,6 +102,9 @@ pub struct CommonOpts {
     pub verify: bool,                // --verify: comprobar sin transferir datos
     pub timeout_secs: u64,           // --timeout N: plazo por comando directo (s)
     pub seek: bool,                  // (speedtest) modo seek: lecturas aleatorias cronometradas
+    // Rescate: variantes ddrescue (U8).
+    pub generate_map: bool,          // (rescue) -G: mapa aproximado desde la imagen destino
+    pub skip_adaptive: bool,         // (rescue/clone) -K: salto geométrico tras bloques fallidos
     pub yes: bool,                   // --yes: segunda confirmación no interactiva (destructivos)
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
@@ -172,8 +175,11 @@ fn usage() -> ! {
          \x20                    un dispositivo montado. Flags nuevos: W escritura mala, M marginal\n\
          \x20 --block N          (rescue) sectores por bloque de la fase directa (def 128 = 64 KiB)\n\
          \x20 --retry N          (rescue) tentativas por sector fallido en el rascado (def 3)\n\
-         \x20 --retry-wait S     (rescue) segundos de descanso entre reintentos y tras bloque\n\
-         \x20                    fallido (def 2; 0 = sin pausas) — en campo: más pausa, menos daño\n\
+         \x20 --retry-wait S     (rescue) segundos de descanso tras un fallo LABORIOSO\n\
+         \x20                    (el medio tardó 1 s o más en fallar): el cabezal agradece\n\
+         \x20                    pausar (def 2; 0 = sin pausas). Un error inmediato del\n\
+         \x20                    firmware no provoca pausa: dormir tras cada bloque muerto\n\
+         \x20                    solo añade horas sin proteger nada\n\
          \x20 --backup-file R    (rescue) sidecar donde respaldar cada sector antes de\n\
          \x20                    sobrescribirlo (def: <imagen>.respaldo)\n\
          \x20 --no-backup        (rescue) desactivar el respaldo — no recomendado\n\
@@ -192,6 +198,14 @@ fn usage() -> ! {
          \x20                    hex+ASCII del último sector leído bien\n\
          \x20 --log-rates RUTA   (rescue) registrar el ritmo en un archivo: una línea\n\
          \x20                    por estado, columnas numéricas aptas para gráficas\n\
+         \x20 --generate-map     (rescue) herencias de dd (estilo -G): deducir el mapa de la\n\
+         \x20                    imagen destino existente — todo-cero = pendiente (se relee del\n\
+         \x20                    origen), no-cero = bueno (no se releerá). Exige imagen existente;\n\
+         \x20                    no combina con --resume ni --import-map\n\
+         \x20 --skip-adaptive    (rescue/clone) salto adaptativo (estilo -K): tras 4 bloques\n\
+         \x20                    fallidos seguidos la fase directa salta distancias crecientes\n\
+         \x20                    en vez de martillar el clúster; lo saltado lo retrabajan las\n\
+         \x20                    fases lentas\n\
          \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
          \x20 --map F            mapfile propio: en rescue el de la imagen\n\
           \x20                    destino (def: <imagen-destino>.map); en las pasadas\n\
@@ -389,6 +403,8 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         verify: false,
         timeout_secs: 30,
         seek: false,
+        generate_map: false,
+        skip_adaptive: false,
         yes: false,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
@@ -446,6 +462,8 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--verify" => o.verify = true,
             "--timeout" => o.timeout_secs = take_num(args, &mut i, "--timeout").clamp(1, 3600),
             "--seek" => o.seek = true,
+            "--generate-map" => o.generate_map = true,
+            "--skip-adaptive" => o.skip_adaptive = true,
             "--yes" => o.yes = true,
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
@@ -916,6 +934,20 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         eprintln!("error: rescue necesita la imagen destino (ruta posicional antes de las opciones)");
         return ExitCode::from(2);
     };
+    if o.generate_map {
+        if o.resume {
+            eprintln!("error: --generate-map construye el mapa desde cero: no combina con --resume (elige uno).");
+            return ExitCode::from(2);
+        }
+        if o.import_map.is_some() {
+            eprintln!("error: --generate-map construye el mapa desde la imagen destino; para un mapa ajeno usa --import-map (elige uno).");
+            return ExitCode::from(2);
+        }
+        if !dest.exists() {
+            eprintln!("error: --generate-map necesita una imagen destino EXISTENTE de la que deducir el mapa (herencias de dd). Para crear la imagen desde cero, omite el flag.");
+            return ExitCode::from(2);
+        }
+    }
     let (display, dev, mut src) = match open_target(o, false) {
         Ok(v) => v,
         Err((msg, code)) => {
@@ -944,7 +976,30 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         s.push_str(".map");
         PathBuf::from(s)
     });
-    let mut map = if let Some(imp) = &o.import_map {
+    let mut map = if o.generate_map {
+        match rescue::generate_map_from_image(&mut img) {
+            Ok(m) => {
+                let (g, f, s, u) = m.stats();
+                println!(
+                    "mapa generado desde la imagen destino (estilo -G): {} sectores no-cero declarados buenos (NO se releerán del origen), {} todo-cero quedan pendientes",
+                    g,
+                    f + s + u
+                );
+                println!("aviso: si un cero era dato legítimo se releerá del origen (nada se pierde); si un no-cero era basura de otra herramienta queda preservado como bueno — usa esto solo con imágenes de rescate propias o copias fiables");
+                if map_path.exists() {
+                    println!(
+                        "aviso: existe un mapfile en {}; --generate-map lo reconstruye desde la imagen y lo sobrescribirá",
+                        map_path.display()
+                    );
+                }
+                m
+            }
+            Err(e) => {
+                eprintln!("error generando el mapa desde la imagen: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else if let Some(imp) = &o.import_map {
         match mapfile::MapFile::import_text(imp, total) {
             Ok(m) => {
                 let (g, _, _, _) = m.stats();
@@ -1024,6 +1079,7 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         max_error_rate: o.max_error_rate,
         preview_lines: o.preview.unwrap_or(0),
         verify_dest: false, // rescue escribe en una imagen de archivo
+        skip_adaptive: o.skip_adaptive,
     };
     match &ropts.backup {
         Some(p) => println!(
@@ -1031,6 +1087,9 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
             p.display()
         ),
         None => println!("aviso: rescate SIN respaldo sector a sector (--no-backup) — lo pedido por el autor es respaldar siempre"),
+    }
+    if o.skip_adaptive {
+        println!("salto adaptativo activado: tras 4 bloques fallidos seguidos la fase directa salta distancias crecientes; lo saltado lo retrabajan las fases lentas (el cabezal deja de martillar el clúster)");
     }
     let mut rates_log: Option<fs::File> = o.log_rates.as_ref().and_then(|p| {
         match fs::OpenOptions::new().create(true).append(true).open(p) {
@@ -1111,6 +1170,12 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         println!(
             "  bloques lentos diferidos por --min-read-rate en la fase directa: {}",
             rep.slow_deferred
+        );
+    }
+    if rep.adaptive_leaps > 0 {
+        println!(
+            "  saltos adaptativos en la fase directa (--skip-adaptive): {}",
+            rep.adaptive_leaps
         );
     }
     if rep.failed + rep.scraped + rep.untried > 0 {
@@ -1357,6 +1422,9 @@ fn cli_clone(o: &CommonOpts) -> ExitCode {
         println!("{line}");
     }
     println!("sin respaldo del destino (documentado): lo que había en {dst_label} se pierde; para conservarlo, rescátalo antes a una imagen");
+    if o.skip_adaptive {
+        println!("salto adaptativo activado: tras 4 bloques fallidos seguidos la fase directa salta distancias crecientes; lo saltado lo retrabajan las fases lentas");
+    }
 
     let ropts = rescue::RescueOptions {
         start: o.start as u64,
@@ -1374,6 +1442,7 @@ fn cli_clone(o: &CommonOpts) -> ExitCode {
         max_error_rate: o.max_error_rate,
         preview_lines: o.preview.unwrap_or(0),
         verify_dest: o.verify,
+        skip_adaptive: o.skip_adaptive,
     };
     let mut rates_log: Option<fs::File> = o.log_rates.as_ref().and_then(|p| {
         match fs::OpenOptions::new().create(true).append(true).open(p) {
@@ -1448,6 +1517,12 @@ fn cli_clone(o: &CommonOpts) -> ExitCode {
         rep.good, rep.failed, rep.scraped, rep.untried
     );
     if rep.failed + rep.scraped + rep.untried > 0 {
+        if rep.adaptive_leaps > 0 {
+            println!(
+                "  saltos adaptativos en la fase directa (--skip-adaptive): {}",
+                rep.adaptive_leaps
+            );
+        }
         println!(
             "  quedan pendientes: repite con --resume (mapa {}). Un origen con ilegibles NO puede clonarse byte a byte: compara el resultado solo en los sectores buenos del mapa.",
             map_path.display()
@@ -3090,6 +3165,8 @@ mod tests {
             verify: false,
             timeout_secs: 30,
             seek: false,
+            generate_map: false,
+            skip_adaptive: false,
             yes: false,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
@@ -3720,5 +3797,67 @@ mod tests {
         // El sidecar guarda copia de cada sector reescrito (5 escrituras × 8 sectores).
         assert!(dir.join("bk").join("DISK11.bak.raw").exists());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--generate-map` y `--skip-adaptive` se reconocen y no encienden nada más.
+    #[test]
+    fn parse_generate_map_y_skip_adaptive() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let o = parse_common(&s(&["d.raw", "--raw", "9"]));
+        assert!(!o.generate_map);
+        assert!(!o.skip_adaptive);
+        let o = parse_common(&s(&[
+            "d.raw",
+            "--raw",
+            "9",
+            "--generate-map",
+            "--skip-adaptive",
+        ]));
+        assert!(o.generate_map);
+        assert!(o.skip_adaptive);
+        assert!(!o.resume, "generate-map no implica resume");
+    }
+
+    /// Puertas de `--generate-map` ANTES de abrir origen ni destino: el mapa se
+    /// deduce de una imagen que ya existe, así que choca con --resume (mapa
+    /// continuo) y con --import-map (mapa ajeno), y exige la imagen.
+    #[test]
+    fn generate_map_gates_antes_de_tocar_nada() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let dir = std::env::temp_dir().join(format!("regrow_gmap_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("no-existe.raw").display().to_string();
+        let exists = dir.join("herencia.raw");
+        fs::write(&exists, vec![0u8; 4096]).unwrap();
+        let exists = exists.display().to_string();
+        let dev = "/dev/regrow-no-existe-zz";
+
+        // Imagen inexistente: no hay de dónde deducir el mapa.
+        assert_eq!(
+            cli_rescue(&parse_common(&s(&[&missing, "--dev", dev, "--generate-map"]))),
+            ExitCode::from(2)
+        );
+        // Choca con --resume.
+        assert_eq!(
+            cli_rescue(&parse_common(&s(&[&exists, "--dev", dev, "--generate-map", "--resume"]))),
+            ExitCode::from(2)
+        );
+        // Choca con --import-map.
+        assert_eq!(
+            cli_rescue(&parse_common(&s(&[
+                &exists,
+                "--dev",
+                dev,
+                "--generate-map",
+                "--import-map",
+                "otro.map",
+            ]))),
+            ExitCode::from(2)
+        );
+        // Ninguna puerta tocó la imagen ni creó mapa.
+        assert_eq!(fs::read(&exists).unwrap(), vec![0u8; 4096]);
+        assert!(!dir.join("herencia.raw.map").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

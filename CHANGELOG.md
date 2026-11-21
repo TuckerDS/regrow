@@ -30,6 +30,38 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   está saliendo del cabezal, al estilo del `-P` de ddrescue.
   `rescue --log-rates RUTA`: una línea numérica por cada estado (segundos,
   sector, buenos, pendientes, bloques, KiB/s), apta para graficar el rescate.
+- `rescue --generate-map`: herencias de `dd` (el `-G` de ddrescue) — el mapa se
+  deduce de la imagen destino ya existente: un sector TODO-CERO se interpreta
+  como «aún no rescatado» (se releerá del origen) y cualquier sector con al
+  menos un byte distinto de cero se da por bueno y NO se releerá. Exige imagen
+  existente y no combina con `--resume` ni con `--import-map`; la cabecera avisa
+  de la ambigüedad (un cero legítimo se releerá sin pérdida; una basura ajena
+  queda preservada como buena).
+- `rescue|clone --skip-adaptive` (salto adaptativo, estilo `-K`): en la fase
+  directa, tras cuatro bloques fallidos seguidos el rescate salta distancias
+  crecientes en vez de seguir martillando el mismo clúster; lo saltado queda
+  pendiente y lo retrabajan las fases lentas, y el resumen cuenta los saltos.
+
+### Fixed
+
+- `rescue`/`clone`: la fase de división ya no puede quedarse martillando para
+  siempre un tramo totalmente ilegible. Cada pasada de división se re-derivaba
+  del mapa, y en un tramo sin nada legible las dos mitades fallidas quedaban
+  pendientes con los mismos reintentos: el mapa las fusionaba de vuelta al tramo
+  original y la división repetía la misma bisección INDEFINIDAMENTE — horas
+  tropezando el mismo clúster sin recuperar un solo sector. Ahora la bisección
+  desciende acotada (hasta el tamaño de bloque) y cada trozo se intenta una
+  sola vez: el rescate siempre termina.
+- `rescue`/`clone`: el rascado recorre TODOS los sectores pendientes, no solo
+  los que el azar de las fusiones del mapa había dejado como entradas de un
+  sector. Los agotados (`Scraped`) vuelven a intentarse solo con `--requeue`,
+  que es su puerta explícita. La fase avisa cuántos sectores le faltan: es la
+  cara del rescate — cuesta un intento por sector pendiente.
+- `rescue`/`clone`: las pausas de `--retry-wait` se aplican solo tras un fallo
+  laborioso (el medio tardó un segundo o más en devolver el error, señal de que
+  el cabezal estuvo aguantando el intento). Dormir también tras cada error
+  inmediato del firmware multiplicaba el tiempo de un dominio grande por el
+  valor de `--retry-wait` sin proteger nada.
 
 ### Security
 
