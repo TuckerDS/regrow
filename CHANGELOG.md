@@ -45,6 +45,17 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 - La puerta «nunca escribir sobre un disco montado» es ahora universal: la
   aplica la capa de dispositivo a todo intento de escritura (CLI y menú,
   repair/refresh/regenerate/testwrite), no solo a `testwrite`.
+- `--verify` (prescan/speedtest, y el prescan dentro de scan/repair): los
+  bloques se comprueban con la lectura de verificación del firmware, sin
+  transferir su contenido por el bus. Requiere nodo de disco ENTERO y punta
+  que lo soporte; donde no está disponible el programa degrada
+  automáticamente a lecturas normales y lo dice en cabecera — un medio «no
+  soportado» jamás se registra como sector dañado. `--timeout S` fija el
+  plazo de cada comando directo (defecto 30 s); si un medio tarda
+  legítimamente lo indica y sugiere subirlo.
+- Al cerrar un dispositivo donde se escribió, además del vaciado del SO se
+  envía FLUSH CACHE al propio disco (solo si la sesión escribió de verdad:
+  una pasada de puro rescate no le manda ninguna orden).
 
 ## [0.2.0] - 2026-11-21
 

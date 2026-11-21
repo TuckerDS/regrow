@@ -44,10 +44,15 @@ impl SpeedReport {
 }
 
 /// Mide la lectura bulk de [start, end) en bloques de `SPEED_CHUNK` sectores.
+/// Con `verify` los bloques se comprueban con la verificación directa del
+/// firmware (sin transferir contenido por el bus; degrada a lecturas normales
+/// donde el medio no la expone).
 pub fn run_speedtest(
     src: &mut dyn SectorSource,
     start: u32,
     end: u32,
+    verify: bool,
+    op_timeout: Duration,
     mut on_progress: impl FnMut(&[ZoneTime]),
 ) -> SpeedReport {
     assert!(start < end, "rango vacío");
@@ -61,15 +66,24 @@ pub fn run_speedtest(
     while cur < end {
         let n = SPEED_CHUNK.min((end - cur) as usize);
         let t0 = Instant::now();
-        let res = src.read_chunk(cur as u64, n, &mut buf[..n * SECTOR_SIZE]);
+        let res = if verify {
+            src.verify_chunk(cur as u64, n, op_timeout)
+        } else {
+            src.read_chunk(cur as u64, n, &mut buf[..n * SECTOR_SIZE])
+        };
         let secs = t0.elapsed().as_secs_f64();
         if res.is_err() {
             errors += 1;
             // Reintentar sector a sector para no perder el mapeo de la zona.
             let mut ok = 0u64;
             for s in cur..cur + n as u32 {
-                let mut one = [0u8; SECTOR_SIZE];
-                if src.read_sector(s as u64, &mut one).is_ok() {
+                let ok_one = if verify {
+                    src.verify_chunk(s as u64, 1, op_timeout).is_ok()
+                } else {
+                    let mut one = [0u8; SECTOR_SIZE];
+                    src.read_sector(s as u64, &mut one).is_ok()
+                };
+                if ok_one {
                     ok += 1;
                 }
             }
@@ -135,7 +149,7 @@ mod tests {
             sectors: 4 * SPEED_CHUNK as u64,
             slow_chunk: 2 * SPEED_CHUNK as u64,
         };
-        let rep = run_speedtest(&mut m, 0, 4 * SPEED_CHUNK as u32, |_| {});
+        let rep = run_speedtest(&mut m, 0, 4 * SPEED_CHUNK as u32, false, Duration::from_secs(5), |_| {});
         assert_eq!(rep.scanned, 4 * SPEED_CHUNK as u64);
         assert_eq!(rep.chunk_secs.len(), 4);
         assert_eq!(rep.errors, 0);
@@ -143,5 +157,19 @@ mod tests {
         assert_eq!(slowest[0].start, 2 * SPEED_CHUNK as u32);
         assert!(slowest[0].secs > 0.05);
         assert!(rep.avg_mb_per_s() > 0.0);
+    }
+
+    /// `--verify` en speedtest: los bloques se comprueban con verify_chunk
+    /// (aquí delega en lecturas) y el resultado es equivalente.
+    #[test]
+    fn speedtest_con_verify_equivalente() {
+        let mut m = Mock {
+            sectors: 2 * SPEED_CHUNK as u64,
+            slow_chunk: u32::MAX as u64, // ninguno lento
+        };
+        let rep = run_speedtest(&mut m, 0, 2 * SPEED_CHUNK as u32, true, Duration::from_secs(5), |_| {});
+        assert_eq!(rep.scanned, 2 * SPEED_CHUNK as u64);
+        assert_eq!(rep.errors, 0);
+        assert_eq!(rep.chunk_secs.len(), 2);
     }
 }

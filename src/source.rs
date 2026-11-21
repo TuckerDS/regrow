@@ -33,6 +33,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const SECTOR_SIZE: usize = 512;
 
@@ -88,6 +89,31 @@ pub trait SectorSource {
             buf[i * SECTOR_SIZE..(i + 1) * SECTOR_SIZE].copy_from_slice(&tmp);
         }
         Ok(())
+    }
+
+    /// Comprueba `count` sectores contiguos sin transferir su contenido a
+    /// espacio de usuario (el READ VERIFY del firmware, U5b). La
+    /// implementación por defecto —imágenes y medios sin acceso ATA directo—
+    /// lee por bloques y descarta: el resultado es equivalente, la diferencia
+    /// está solo en el bus. `RawDisk` la sobrescribe con SG_IO cuando el nodo
+    /// lo expone. Un fallo aquí es un intento fallido legítimo; un medio que
+    /// NO soporta la verificación directa degrada a lecturas normales en el
+    /// propio `RawDisk` (jamás se marca eso como sector dañado).
+    fn verify_chunk(&mut self, lba: u64, count: usize, _timeout: Duration) -> io::Result<()> {
+        let mut tmp = vec![0u8; 64.min(count.max(1)) * SECTOR_SIZE];
+        let mut done = 0usize;
+        while done < count {
+            let n = 64.min(count - done);
+            self.read_chunk(lba + done as u64, n, &mut tmp[..n * SECTOR_SIZE])?;
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// ¿Puede este backend verificar sin sacar los datos a espacio de
+    /// usuario? `false` ⇒ `verify_chunk` degrada a lecturas normales.
+    fn supports_direct_verify(&self) -> bool {
+        false
     }
 }
 
@@ -216,6 +242,19 @@ pub struct RawDisk {
     /// true si el nodo NO es un disco físico entero (p. ej. contenedor APFS
     /// sintetizado en macOS). Tales nodos se excluyen de la enumeración.
     synthesized: bool,
+    /// Linux: el nodo responde a los ioctls SCSI generic (consulta pasiva al
+    /// abrir). Base para la verificación ATA directa y FLUSH CACHE.
+    #[allow(dead_code)] // leído solo en la sonda y el cierre (Linux)
+    sg_ok: bool,
+    /// Verificación ATA directa permitida y en uso: `sg_ok` además de nodo de
+    /// disco ENTERO (las órdenes ATA direccionan el disco físico completo; un
+    /// mapfile partición-relativo no se corresponde con sus LBA). Se apaga al
+    /// primer «no soportado» y la sesión degrada a lecturas normales.
+    verify_direct: bool,
+    /// ¿Se escribió algo en esta apertura? Solo entonces el cierre manda
+    /// BLKFLSBUF/FLUSH CACHE (una apertura de puro rescate no debe enviar
+    /// órdenes de escritura al medio).
+    wrote: bool,
 }
 
 // -------------------------------------------------- puerta de montaje --------
@@ -302,6 +341,41 @@ pub(crate) fn mounted_overlap(dev: &Path) -> Option<String> {
     // Una ruta tipo /dev/disk/by-partuuid/… se resuelve al nodo real del disco.
     let real = std::fs::canonicalize(dev).unwrap_or_else(|_| dev.to_path_buf());
     mounted_overlap_with(&real.to_string_lossy(), &mount_table())
+}
+
+/// ¿El nodo (resolviendo enlaces) es una PARTICIÓN (`sda2`, `nvme0n1p2`,
+/// `mmcblk0p1`, `disk2s1`)? Las órdenes ATA directas direccionan el disco
+/// físico completo: la verificación directa solo se permite en nodos de disco
+/// entero — en un nodo de partición el mapfile es partición-relativo y los
+/// LBA del ATA no lo son. `loop*` y nombres desconocidos cuentan como disco
+/// entero (si la ponta rechaza el comando, la sesión degrada sola).
+#[allow(dead_code)] // lo consumen la sonda de apertura y el cierre, ambos Linux
+pub(crate) fn looks_like_partition(path: &Path) -> bool {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let base = canon.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let b = match base.strip_prefix("rdisk") {
+        Some(rest) => format!("disk{rest}"),
+        None => base.to_string(),
+    };
+    if let Some(rest) = b.strip_prefix("nvme") {
+        return rest.contains('p');
+    }
+    if let Some(rest) = b.strip_prefix("mmcblk") {
+        return rest.contains('p');
+    }
+    if let Some(rest) = b.strip_prefix("disk") {
+        // macOS: disk2 es el disco entero; disk2s1 es partición.
+        return rest.contains('s');
+    }
+    for pre in ["xvd", "sd", "hd", "vd"] {
+        if let Some(rest) = b.strip_prefix(pre) {
+            // sda/vda enteros: solo letras tras el prefijo. sda2/vda1: letras
+            // y después dígitos.
+            let letters = rest.trim_end_matches(|c: char| c.is_ascii_digit());
+            return !letters.is_empty() && letters.len() < rest.len();
+        }
+    }
+    false
 }
 
 /// Banderas de apertura de Linux (asm-generic/fcntl.h). El test
@@ -513,7 +587,8 @@ impl RawDisk {
 
         // La gramática de registros es de 512 B lógicos, también en 4Kn.
         let (media, synthesized) = detect_media(&file, path);
-        Ok(Self {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut d = Self {
             file,
             sectors: bytes / SECTOR_SIZE as u64,
             bulk: Box::new(AlignedBulk([0u8; BULK_BYTES])),
@@ -521,7 +596,19 @@ impl RawDisk {
             bulk_stage: strict || phys != SECTOR_SIZE,
             media,
             synthesized,
-        })
+            sg_ok: false,
+            verify_direct: false,
+            wrote: false,
+        };
+        // Linux: consulta SG pasiva (sin efecto sobre el medio) para habilitar
+        // la verificación ATA directa solo en nodos de disco entero.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            d.sg_ok = crate::ata::sg_supported(d.file.as_raw_fd());
+            d.verify_direct = d.sg_ok && !looks_like_partition(path);
+        }
+        Ok(d)
     }
 
     /// Lee el bloque físico 0 con el búfer alineado para validar el modo de
@@ -639,6 +726,7 @@ impl SectorSource for RawDisk {
             self.file.seek(SeekFrom::Start(blk * self.phys as u64))?;
             self.file.write_all(&self.bulk.0[..self.phys])?;
         }
+        self.wrote = true;
         // La escritura ya está en el medio (O_SYNC/O_DIRECT); invalida la
         // caché del kernel para que nadie vea el contenido viejo.
         #[cfg(target_os = "linux")]
@@ -687,16 +775,85 @@ impl SectorSource for RawDisk {
         }
         Ok(())
     }
+
+    /// Verificación ATA directa por SG_IO (Linux, nodo de disco entero): el
+    /// firmware comprueba los bloques sin arrastrar contenido por el bus. Si
+    /// la ponta rechaza el comando, la sesión entera degrada a lecturas
+    /// normales — un «no soportado» jamás debe leerse como sector dañado.
+    fn verify_chunk(&mut self, lba: u64, count: usize, timeout: Duration) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            if self.verify_direct {
+                let mut done = 0usize;
+                while done < count {
+                    // Tope holgado por comando (el engine usa bloques ≤ 2048
+                    // sectores; 32768 deja margen para verbos futuros).
+                    let n = 32768.min(count - done);
+                    let cdb = crate::ata::cdb_read_verify48(lba + done as u64, n as u16);
+                    match crate::ata::sg_ata_cmd(self.file.as_raw_fd(), &cdb, timeout) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                            self.verify_direct = false;
+                            break; // degradar el resto de la sesión
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    done += n;
+                }
+                if self.verify_direct {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = timeout;
+        self.verify_via_reads(lba, count)
+    }
+
+    fn supports_direct_verify(&self) -> bool {
+        self.verify_direct
+    }
+}
+
+impl RawDisk {
+    /// Degradación de la verificación: lecturas por bloques que se descartan
+    /// (equivale a comprobar que cada sector responde).
+    fn verify_via_reads(&mut self, lba: u64, count: usize) -> io::Result<()> {
+        let mut tmp = vec![0u8; 64.min(count.max(1)) * SECTOR_SIZE];
+        let mut done = 0usize;
+        while done < count {
+            let n = 64.min(count - done);
+            self.read_chunk(lba + done as u64, n, &mut tmp[..n * SECTOR_SIZE])?;
+            done += n;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RawDisk {
     fn drop(&mut self) {
-        // Vaciado de los sectores reescritos antes de cerrar el dispositivo
-        // y adiós a la caché rancia del kernel (por si el fd se cerró antes
-        // de cualquier verificación posterior).
+        // Vaciado de los sectores reescritos antes de cerrar el dispositivo.
         let _ = self.file.sync_all();
+        // Solo una apertura que escribió debe mandarle órdenes de vaciado al
+        // medio: una pasada de puro rescate (solo lectura) no le envía ninguna.
+        if !self.wrote {
+            return;
+        }
         #[cfg(target_os = "linux")]
-        self.flush_bufs();
+        {
+            use std::os::unix::io::AsRawFd;
+            self.flush_bufs();
+            if self.sg_ok {
+                // FLUSH CACHE al cierre: vacía también la caché de escritura
+                // del propio disco (con O_SYNC y BLKFLSBUF, los tres puntos
+                // del camino quedan vacíos).
+                let _ = crate::ata::sg_ata_cmd(
+                    self.file.as_raw_fd(),
+                    &crate::ata::cdb_flush_cache(),
+                    Duration::from_secs(30),
+                );
+            }
+        }
     }
 }
 
@@ -1325,6 +1482,54 @@ mod tests {
         assert_eq!(disk_key("/dev/nvme0n1"), "nvme0n1");
         assert_eq!(disk_key("/dev/nvme0n1p2"), "nvme0n1");
         assert_eq!(disk_key("/dev/mmcblk0p1"), "mmcblk0");
+    }
+
+    /// La sonda de nodo distinguible disco-entero vs partición: las órdenes
+    /// ATA directas solo se permiten en la primera. Nombres de las cuatro
+    /// familias de dispositivos (los que no existen en el SO de la máquina
+    /// se evalúan por su forma, sin canonicalizar).
+    #[test]
+    fn looks_like_partition_reconoce_disco_y_particion() {
+        // Linux ATA/clásico y virtualizados.
+        assert!(!looks_like_partition(Path::new("/dev/sda")));
+        assert!(looks_like_partition(Path::new("/dev/sda2")));
+        assert!(!looks_like_partition(Path::new("/dev/hdb")));
+        assert!(looks_like_partition(Path::new("/dev/hdb3")));
+        assert!(!looks_like_partition(Path::new("/dev/vda")));
+        assert!(looks_like_partition(Path::new("/dev/vdb1")));
+        assert!(!looks_like_partition(Path::new("/dev/xvda")));
+        assert!(looks_like_partition(Path::new("/dev/xvda1")));
+        // NVMe y MMC usan marcador 'p'.
+        assert!(!looks_like_partition(Path::new("/dev/nvme0n1")));
+        assert!(looks_like_partition(Path::new("/dev/nvme0n1p2")));
+        assert!(!looks_like_partition(Path::new("/dev/mmcblk0")));
+        assert!(looks_like_partition(Path::new("/dev/mmcblk0p1")));
+        // macOS: diskN entero, diskNsN partición; rdiskN es el entero raw.
+        assert!(!looks_like_partition(Path::new("/dev/rdisk2")));
+        assert!(!looks_like_partition(Path::new("/dev/disk2")));
+        assert!(looks_like_partition(Path::new("/dev/disk2s1")));
+        // Sintéticos y desconocidos cuentan como disco entero (si la punta
+        // rechaza el comando, la sesión degrada sola).
+        assert!(!looks_like_partition(Path::new("/dev/loop1")));
+        assert!(!looks_like_partition(Path::new("/dev/foobar")));
+    }
+
+    /// `verify_chunk` por defecto (imágenes): comprueba leyendo por bloques.
+    /// Equivale a verificar que cada sector responde; más allá del fin de la
+    /// imagen es un fallo legítimo.
+    #[test]
+    fn file_image_verify_chunk_degrada_a_lecturas() {
+        let dir = std::env::temp_dir().join(format!("regrow_vfy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("vfy.raw");
+        let mut img = FileImage::create(&p, 200).unwrap();
+        assert!(!img.supports_direct_verify(), "una imagen no tiene ATA");
+        assert!(img.verify_chunk(0, 8, Duration::from_secs(5)).is_ok());
+        assert!(img.verify_chunk(190, 10, Duration::from_secs(5)).is_ok());
+        let e = img.verify_chunk(195, 10, Duration::from_secs(5));
+        assert!(e.is_err(), "verificar más allá del fin debe fallar");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

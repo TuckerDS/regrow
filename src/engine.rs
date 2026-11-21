@@ -90,6 +90,12 @@ pub struct EngineOptions {
     /// Prescan bulk para Scan/Repair/Refresh (los bloques sanos se saltean
     /// sin lectura sector a sector). No aplica a Regenerate: ahí se escribe todo.
     pub prescan: bool,
+    /// Prescan/medición con verificación directa del firmware (ATA READ
+    /// VERIFY, sin transferir contenido por el bus). Donde el medio no la
+    /// expone, `SectorSource` degrada automáticamente a lecturas normales.
+    pub verify: bool,
+    /// Plazo por comando ATA directo antes de dar el intento por caducado.
+    pub op_timeout: Duration,
     /// Pasada quirúrgica: tramos `[inicio, fin)` a procesar, ascendentes y
     /// disjuntos, siempre dentro de `[start, end)`. Con `Some(...)` la pasada
     /// visita SOLO esos sectores (los huecos se declaran sanos por un mapa
@@ -108,6 +114,8 @@ impl EngineOptions {
             bands: Some(DEFAULT_LATENCY_BANDS),
             allow_data_loss: false,
             prescan: false,
+            verify: false,
+            op_timeout: Duration::from_secs(30),
             ranges: None,
         }
     }
@@ -372,7 +380,11 @@ pub fn prescan<S: SectorSource + ?Sized>(
         }
         let n = PRESCAN_CHUNK.min((end - cur) as usize);
         let t0 = Instant::now();
-        let bulk_res = src.read_chunk(cur as u64, n, &mut chunk_buf[..n * SECTOR_SIZE]);
+        let bulk_res = if opts.verify {
+            src.verify_chunk(cur as u64, n, opts.op_timeout)
+        } else {
+            src.read_chunk(cur as u64, n, &mut chunk_buf[..n * SECTOR_SIZE])
+        };
         let bulk_slow = chunk_is_slow(t0.elapsed(), n);
 
         if bulk_res.is_ok() && !bulk_slow {
@@ -394,7 +406,11 @@ pub fn prescan<S: SectorSource + ?Sized>(
                 }
                 let idx = cell_idx_for(c, start, cell_span);
                 let t = Instant::now();
-                let read_failed = src.read_sector(c as u64, &mut buf).is_err();
+                let read_failed = if opts.verify {
+                    src.verify_chunk(c as u64, 1, opts.op_timeout).is_err()
+                } else {
+                    src.read_sector(c as u64, &mut buf).is_err()
+                };
                 let band = latency_band(t.elapsed(), delay, opts.bands);
                 if read_failed {
                     rep.problems.push((c, ProblemKind::Unreadable));
@@ -1178,6 +1194,7 @@ mod tests {
         content: std::collections::HashMap<u64, [u8; SECTOR_SIZE]>, // lo que hay tras escribir
         lie: std::collections::HashMap<u64, HashSet<u8>>, // el sector miente al releer
                                                            // un contenido cuyo byte es `pattern`
+        verify_calls: usize, // llamadas a verify_chunk (--verify)
     }
 
     impl MockSource {
@@ -1195,6 +1212,7 @@ mod tests {
                 noop: None,
                 content: std::collections::HashMap::new(),
                 lie: std::collections::HashMap::new(),
+                verify_calls: 0,
             }
         }
     }
@@ -1243,6 +1261,17 @@ mod tests {
             self.written.insert(lba);
             self.written_bytes.push((lba, buf[0]));
             self.content.insert(lba, *buf);
+            Ok(())
+        }
+
+        // Con `--verify` el mock cuenta las comprobaciones y delega en la
+        // lectura (como cualquier backend sin acceso ATA directo).
+        fn verify_chunk(&mut self, lba: u64, count: usize, _timeout: Duration) -> io::Result<()> {
+            self.verify_calls += 1;
+            let mut tmp = [0u8; SECTOR_SIZE];
+            for i in 0..count {
+                self.read_sector(lba + i as u64, &mut tmp)?;
+            }
             Ok(())
         }
     }
@@ -1613,6 +1642,29 @@ mod tests {
         );
         assert_eq!(rep.retried_chunks, 1);
         assert_eq!(rep.bulk_chunks, 2);
+    }
+
+    /// Prescan con `--verify`: cada bloque (y el aislamiento posterior) se
+    /// comprueba vía verify_chunk; el resultado debe ser idéntico al del
+    /// prescan por lectura (la verificación no cambia la clasificación,
+    /// solo ahorra el transporte de datos donde el medio la soporta).
+    #[test]
+    fn prescan_con_verify_clasifica_igual_que_por_lectura() {
+        let mut src = MockSource::new(300);
+        src.broken.insert(130); // cae en el segundo bloque bulk
+        let mut opts = fast_opts(RunMode::Scan, 0, 300);
+        opts.verify = true;
+        let rep = prescan(&mut src, &opts, &mut hooks_empty(), collect());
+        assert_eq!(rep.problems, vec![(130, ProblemKind::Unreadable)]);
+        assert!(src.verify_calls > 0, "con --verify todo debe pasar por verify_chunk");
+
+        let mut plain = MockSource::new(300);
+        plain.broken.insert(130);
+        let opts_plain = fast_opts(RunMode::Scan, 0, 300);
+        let rep2 = prescan(&mut plain, &opts_plain, &mut hooks_empty(), collect());
+        assert_eq!(rep.problems, rep2.problems);
+        assert_eq!(rep.bulk_chunks, rep2.bulk_chunks);
+        assert_eq!(rep.retried_chunks, rep2.retried_chunks);
     }
 
     /// Refresh: reescribe los mismos bytes de los lentos (cualquier

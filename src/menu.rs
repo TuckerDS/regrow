@@ -743,6 +743,8 @@ mod tests {
             requeue: false,
             preview: None,
             log_rates: None,
+            verify: false,
+            timeout_secs: 30,
             sectors: None,
             cells: crate::surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,

@@ -20,6 +20,7 @@
 //! `diskstats/DISKn.state` automático: `--resume` lo retoma y el menú lo ofrece
 //! al elegir una unidad que tenga una pasada interrumpida.
 
+mod ata;
 mod backup;
 mod config;
 mod engine;
@@ -95,6 +96,9 @@ pub struct CommonOpts {
     pub requeue: bool,               // (rescue) los tramos agotados vuelven a pendientes
     pub preview: Option<usize>,      // (rescue) avance hex+ASCII en el estado (líneas)
     pub log_rates: Option<PathBuf>,  // (rescue) registro de ritmo apto para gráficas
+    // Verificación directa del firmware (prescan/speedtest):
+    pub verify: bool,                // --verify: comprobar sin transferir datos
+    pub timeout_secs: u64,           // --timeout N: plazo por comando directo (s)
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
     pub cells: usize,         // resolución del mapa (def 1024)
@@ -127,6 +131,12 @@ fn usage() -> ! {
          \x20 --allow-data-loss  escribir ceros sobre ilegibles para forzar su\n\
          \x20                    reasignación por el firmware (destructivo; por defecto NO)\n\
          \x20 --prescan          barrido bulk previo dentro de scan/repair\n\
+         \x20 --verify           (prescan/speedtest) comprobar sectores sin transferir\n\
+         \x20                    su contenido (lectura de verificación del firmware).\n\
+         \x20                    Requiere nodo de disco ENTERO y soporte de la punta;\n\
+         \x20                    si el medio no lo expone degrada a lecturas normales\n\
+         \x20                    (nunca marca eso como sector dañado)\n\
+         \x20 --timeout S        plazo en segundos de cada comando directo (def 30)\n\
          \x20 --resume           retomar la pasada interrumpida desde DISKn.state\n\
          \x20                    (en el menú se ofrece solo si la unidad tiene una)\n\
          \x20 --max-temp C       pausar la pasada (scan/repair/refresh/rescue) si el disco\n\
@@ -351,6 +361,8 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         requeue: false,
         preview: None,
         log_rates: None,
+        verify: false,
+        timeout_secs: 30,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
         out_path: None,
@@ -403,6 +415,8 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
                 o.preview = Some(n.clamp(1, 32) as usize);
             }
             "--log-rates" => o.log_rates = Some(take_path(args, &mut i, "--log-rates")),
+            "--verify" => o.verify = true,
+            "--timeout" => o.timeout_secs = take_num(args, &mut i, "--timeout").clamp(1, 3600),
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
             "--backup-file" => o.backup_file = Some(take_path(args, &mut i, "--backup-file")),
@@ -1125,6 +1139,21 @@ fn cli_surfmap(o: &CommonOpts) -> ExitCode {
     }
 }
 
+/// Cómo `--verify` se traduce en la práctica para este backend:
+/// verificación directa del firmware (ATA READ VERIFY, Linux sobre nodo de
+/// disco entero) o degradación a lecturas normales. Un «no soportado» jamás
+/// se registra como sector dañado.
+fn verify_note(o: &CommonOpts, src: &dyn SectorSource) -> String {
+    if !o.verify {
+        return String::new();
+    }
+    if src.supports_direct_verify() {
+        " — verificación directa del firmware (sin transferir contenido)".to_string()
+    } else {
+        " — el medio no expone verificación directa: degrada a lecturas normales".to_string()
+    }
+}
+
 fn cli_prescan(o: &CommonOpts) -> ExitCode {
     let (label, _dev, mut src) = match open_target(o, false) {
         Ok(v) => v,
@@ -1138,9 +1167,10 @@ fn cli_prescan(o: &CommonOpts) -> ExitCode {
         Err(c) => return c,
     };
     println!(
-        "{label}: {} sectores (medio: {}), barrido bulk [{start}..{end}) — prescan",
+        "{label}: {} sectores (medio: {}), barrido bulk [{start}..{end}) — prescan{}",
         src.sector_count(),
-        src.media().label()
+        src.media().label(),
+        verify_note(o, &*src),
     );
 
     let mut last_bar = String::new();
@@ -1149,6 +1179,8 @@ fn cli_prescan(o: &CommonOpts) -> ExitCode {
     // Umbrales coherentes con el motor: delay = banda T4 .
     let mut eo = EngineOptions::new(RunMode::Scan, start, end);
     eo.set_bands(o.bands);
+    eo.verify = o.verify;
+    eo.op_timeout = Duration::from_secs(o.timeout_secs);
     eo.delay = Duration::from_millis(o.delay_ms);
     let pre = prescan(
         &mut *src,
@@ -1235,20 +1267,28 @@ fn cli_speedtest(o: &CommonOpts) -> ExitCode {
         Err(c) => return c,
     };
     println!(
-        "{label}: {} sectores (medio: {}), lectura bulk [{start}..{end}) — speedtest ({} KiB/bloque)",
+        "{label}: {} sectores (medio: {}), lectura bulk [{start}..{end}) — speedtest ({} KiB/bloque){}",
         src.sector_count(),
         src.media().label(),
-        SPEED_CHUNK * 512 / 1024
+        SPEED_CHUNK * 512 / 1024,
+        verify_note(o, &*src),
     );
-    let rep = run_speedtest(&mut *src, start, end, |zones| {
-        let done: u64 = zones.iter().map(|_| SPEED_CHUNK as u64).sum();
-        let _ = write!(
-            std::io::stdout(),
-            "\rleídos {} sectores",
-            done.min((end - start) as u64)
-        );
-        let _ = std::io::stdout().flush();
-    });
+    let rep = run_speedtest(
+        &mut *src,
+        start,
+        end,
+        o.verify,
+        Duration::from_secs(o.timeout_secs),
+        |zones| {
+            let done: u64 = zones.iter().map(|_| SPEED_CHUNK as u64).sum();
+            let _ = write!(
+                std::io::stdout(),
+                "\rleídos {} sectores",
+                done.min((end - start) as u64)
+            );
+            let _ = std::io::stdout().flush();
+        },
+    );
     let _ = writeln!(std::io::stdout());
     println!(
         "media: {:.1} MB/s en {} bloques ({} sectores), {} bloques con error",
@@ -1803,6 +1843,8 @@ pub(crate) fn process_run(
     opts.bands = o.bands;
     opts.allow_data_loss = o.allow_data_loss;
     opts.prescan = o.prescan && mode != RunMode::Regenerate;
+    opts.verify = o.verify;
+    opts.op_timeout = Duration::from_secs(o.timeout_secs);
 
     // Red de seguridad: una pasada quirúrgica interrumpida NO se reanuda como
     // barrido continuo (el menú no trae plan). Barrer el rango volvería a leer
@@ -1876,10 +1918,15 @@ pub(crate) fn process_run(
     let phys = src.phys_block();
 
     say(format!(
-        "{display}: {} sectores (medio: {}), rango [{start}..{end}) — modo {}",
+        "{display}: {} sectores (medio: {}), rango [{start}..{end}) — modo {}{}",
         src.sector_count(),
         media.label(),
-        mode_word(mode)
+        mode_word(mode),
+        if o.verify && opts.prescan {
+            verify_note(o, src)
+        } else {
+            String::new()
+        },
     ));
     if surgical {
         say(format!(
@@ -2358,6 +2405,8 @@ mod tests {
             requeue: false,
             preview: None,
             log_rates: None,
+            verify: false,
+            timeout_secs: 30,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
@@ -2512,6 +2561,21 @@ mod tests {
         // Imagen sin --raw: id 1 por defecto.
         let o = parse_common(&s(&["img.raw"]));
         assert_eq!((o.id, o.id_explicit), (1, false));
+    }
+
+    /// `--verify` enciende la comprobación directa; `--timeout` fija el plazo
+    /// por comando (defecto 30 s, acotado a un rango sensato).
+    #[test]
+    fn parse_verify_y_timeout() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let o = parse_common(&s(&["speedtest"]));
+        assert!(!o.verify);
+        assert_eq!(o.timeout_secs, 30);
+        let o = parse_common(&s(&["speedtest", "--verify", "--timeout", "90"]));
+        assert!(o.verify);
+        assert_eq!(o.timeout_secs, 90);
+        let o = parse_common(&s(&["prescan", "--verify", "--timeout", "0"]));
+        assert_eq!(o.timeout_secs, 1, "el plazo se acota al menos a 1 s");
     }
 
     /// La rama de abort del process_run vuelca los records parciales a la
