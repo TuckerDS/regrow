@@ -1,6 +1,6 @@
 [package]
 name = "regrow"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Utilidad libre de recuperación de sectores crudos (scan/repair/refresh/regenerate) para HDD, SSD y NVMe desde el SO anfitrión."
 license = "GPL-3.0-or-later"

@@ -6,6 +6,8 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
 ### Added
 
 - `testwrite`: battery multi-patrón de superficie. Por cada sector objetivo
