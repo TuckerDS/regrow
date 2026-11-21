@@ -68,6 +68,12 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   (smartctl o hdparm en Linux; en macOS/Windows queda documentado, no
   ejecutado). Doble confirmación obligatoria (--allow-data-loss + teclear
   SANEAR, o --yes en uso no interactivo) y jamás sobre un disco montado.
+- `speedtest --seek`: perfil de tiempos de posicionamiento — 256 lecturas de
+  un sector en posiciones aleatorias del rango, cronometradas una a una, con
+  media, mediana, p95 y máximo en ms y los cinco sondeos más lentos. Las
+  posiciones son reproducibles (misma semilla: el benchmark se puede comparar
+  consigo mismo). Solo lectura; la rotación del medio (SMART) se muestra en
+  cabecera cuando está disponible, para dar contexto a las cifras.
 - Verbo nuevo `clone --from PATH --raw N | --dev PATH`: clona sector a sector
   un origen (imagen .raw o nodo crudo) a un DESTINO crudo con las mismas fases
   y el mapfile reanudable del rescate — la forma ddrescue de devolver los

@@ -101,6 +101,7 @@ pub struct CommonOpts {
     // Verificación directa del firmware (prescan/speedtest):
     pub verify: bool,                // --verify: comprobar sin transferir datos
     pub timeout_secs: u64,           // --timeout N: plazo por comando directo (s)
+    pub seek: bool,                  // (speedtest) modo seek: lecturas aleatorias cronometradas
     pub yes: bool,                   // --yes: segunda confirmación no interactiva (destructivos)
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
@@ -154,6 +155,11 @@ fn usage() -> ! {
          \x20                    si el medio no lo expone degrada a lecturas normales\n\
          \x20                    (nunca marca eso como sector dañado)\n\
          \x20 --timeout S        plazo en segundos de cada comando directo (def 30)\n\
+         \x20 --seek             (speedtest) modo sondeo de posicionamiento: 256 lecturas de un\n\
+         \x20                    sector en posiciones aleatorias del rango, cronometradas una a\n\
+         \x20                    una (media/mediana/p95 en ms; posiciones reproducibles). Solo\n\
+         \x20                    lectura; muestra la rotación del medio desde SMART cuando está\n\
+         \x20                    disponible.\n\
          \x20 --resume           retomar la pasada interrumpida desde DISKn.state\n\
          \x20                    (en el menú se ofrece solo si la unidad tiene una)\n\
          \x20 --max-temp C       pausar la pasada (scan/repair/refresh/rescue) si el disco\n\
@@ -382,6 +388,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         from: None,
         verify: false,
         timeout_secs: 30,
+        seek: false,
         yes: false,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
@@ -438,6 +445,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--from" => o.from = Some(take_path(args, &mut i, "--from")),
             "--verify" => o.verify = true,
             "--timeout" => o.timeout_secs = take_num(args, &mut i, "--timeout").clamp(1, 3600),
+            "--seek" => o.seek = true,
             "--yes" => o.yes = true,
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
@@ -1741,6 +1749,26 @@ fn verify_note(o: &CommonOpts, src: &dyn SectorSource) -> String {
     }
 }
 
+/// RPM del medio desde SMART, para dar contexto a las cifras de `--seek`
+/// (8 ms es un seek excelente a 5400 rpm y discreto a 7200). Donde no hay
+/// smartctl o el nodo no responde SMART, simplemente no se muestra: ausencia
+/// de información, jamás error.
+fn rotation_note(dev: Option<&Path>) -> String {
+    let Some(d) = dev else {
+        return String::new();
+    };
+    if !smart::smart_available() {
+        return String::new();
+    }
+    match smart::query(d) {
+        Ok(info) => match info.rotation_rate.as_deref() {
+            Some(r) => format!(" · rotación SMART: {r}"),
+            None => String::new(),
+        },
+        Err(_) => String::new(),
+    }
+}
+
 fn cli_prescan(o: &CommonOpts) -> ExitCode {
     let (label, _dev, mut src) = match open_target(o, false) {
         Ok(v) => v,
@@ -1848,7 +1876,7 @@ fn cli_prescan(o: &CommonOpts) -> ExitCode {
 }
 
 fn cli_speedtest(o: &CommonOpts) -> ExitCode {
-    let (label, _dev, mut src) = match open_target(o, false) {
+    let (label, dev, mut src) = match open_target(o, false) {
         Ok(v) => v,
         Err((msg, code)) => {
             eprintln!("{msg}");
@@ -1859,6 +1887,52 @@ fn cli_speedtest(o: &CommonOpts) -> ExitCode {
         Ok(v) => v,
         Err(c) => return c,
     };
+    if o.seek {
+        // Modo seek (cosecha Victoria): tiempos de posicionamiento con
+        // lecturas individuales en posiciones aleatorias. Solo lectura.
+        println!(
+            "{label}: {} sectores (medio: {}), sondeo de posicionamiento [{start}..{end}) — speedtest --seek ({} lecturas aleatorias){}",
+            src.sector_count(),
+            src.media().label(),
+            speed::SEEK_SAMPLES,
+            rotation_note(dev.as_deref()),
+        );
+        if src.media() == MediaKind::Ssd {
+            println!("aviso: en medio sólido estas cifras son tiempo de acceso, no seek mecánico");
+        }
+        if o.verify {
+            println!("aviso: en modo seek se ignora --verify (aquí interesa el tiempo de la lectura real)");
+        }
+        let rep = speed::run_seektest(
+            &mut *src,
+            start,
+            end,
+            speed::SEEK_SAMPLES,
+            0, // semilla interna fija: el mapa de sondeos es reproducible
+            |s| {
+                let _ = write!(std::io::stdout(), "\rsondeados {} sectores", s.len());
+                let _ = std::io::stdout().flush();
+            },
+        );
+        let _ = writeln!(std::io::stdout());
+        println!(
+            "media: {:.2} ms · mediana: {:.2} ms · p95: {:.2} ms · máximo: {:.2} ms en {} sondeos ({:.1} s), {} lecturas fallidas",
+            rep.avg_ms(),
+            rep.median_ms(),
+            rep.p95_ms(),
+            rep.max_ms(),
+            rep.samples.len(),
+            rep.elapsed.as_secs_f64(),
+            rep.errors,
+        );
+        if !rep.samples.is_empty() {
+            println!("sondeos más lentos:");
+            for s in rep.slowest(5) {
+                println!("  sector {}: {:.2} ms", s.lba, s.secs * 1000.0);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
     // Sondeo de realidad antes de la cabecera (ver nota en cli_prescan).
     if o.verify && src.supports_direct_verify() {
         let _ = src.verify_chunk(start as u64, 1, Duration::from_secs(o.timeout_secs));
@@ -3015,6 +3089,7 @@ mod tests {
             from: None,
             verify: false,
             timeout_secs: 30,
+            seek: false,
             yes: false,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
@@ -3185,6 +3260,17 @@ mod tests {
         assert_eq!(o.timeout_secs, 90);
         let o = parse_common(&s(&["prescan", "--verify", "--timeout", "0"]));
         assert_eq!(o.timeout_secs, 1, "el plazo se acota al menos a 1 s");
+    }
+
+    /// `--seek` activa el modo de sondeo de posicionamiento en speedtest.
+    #[test]
+    fn parse_seek() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let o = parse_common(&s(&["speedtest"]));
+        assert!(!o.seek);
+        let o = parse_common(&s(&["speedtest", "--seek"]));
+        assert!(o.seek);
+        assert!(!o.verify, "seek no activa verify por sí solo");
     }
 
     /// sanitize exige modo y destino crudo; sin --allow-data-loss se rechaza
