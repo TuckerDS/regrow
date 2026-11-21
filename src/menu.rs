@@ -740,6 +740,7 @@ mod tests {
             rate_limit: None,
             min_read_rate: crate::rescue::MinRate::Off,
             max_error_rate: None,
+            requeue: false,
             sectors: None,
             cells: crate::surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
