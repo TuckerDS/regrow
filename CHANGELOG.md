@@ -31,6 +31,21 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   `rescue --log-rates RUTA`: una línea numérica por cada estado (segundos,
   sector, buenos, pendientes, bloques, KiB/s), apta para graficar el rescate.
 
+### Security
+
+- Dispositivos crudos en Linux: las escrituras por fin llevan `O_SYNC` de
+  verdad (el valor que usábamos era `O_NONBLOCK`; un test deriva ahora los
+  números oficiales para no repetirlo). Todo intento de escritura abre además
+  con `O_EXCL` — el kernel rechaza con mensaje claro escribir sobre un disco
+  montado o retenido en exclusivo — y `BLKROGET` avisa de medios con bloqueo
+  físico de escritura. Tras cada sector reescrito y al cerrar el dispositivo
+  se ejecuta `BLKFLSBUF`, que invalida la caché de bloques del kernel: ningún
+  lector posterior (nuestra verificación, el SO al remontar, otra
+  herramienta) verá contenido anterior a nuestras reescrituras.
+- La puerta «nunca escribir sobre un disco montado» es ahora universal: la
+  aplica la capa de dispositivo a todo intento de escritura (CLI y menú,
+  repair/refresh/regenerate/testwrite), no solo a `testwrite`.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added

@@ -10,8 +10,12 @@
 //!   `\\.\PhysicalDriveN` (Windows). Requiere root/administrador.
 //!
 //! Endurecimiento del acceso crudo:
-//! - Linux: `O_SYNC` en escrituras (los reintentos llegan al medio, no al
-//!   page cache) y sondeo `O_DIRECT` con fallback.
+//! - Linux: escrituras con `O_SYNC` real (cada reescritura llega al medio
+//!   antes de devolver) y `O_EXCL` (el kernel responde EBUSY si el disco está
+//!   montado o retenido en exclusivo); sondeo `O_DIRECT` con fallback;
+//!   `BLKROGET` avisa de bloqueo físico de escritura y `BLKFLSBUF` invalida
+//!   la caché de bloques del kernel tras escribir (lección de TestDisk: sin
+//!   él, lectores posteriores ven el contenido anterior a la reescritura).
 //! - macOS: `fcntl(F_NOCACHE)` tras abrir (bypass de la caché de unify/buffer).
 //! - Windows: `FILE_FLAG_WRITE_THROUGH` + `FILE_FLAG_NO_BUFFERING` con búfer
 //!   bulk alineado propio ; si el probe del NO_BUFFERING falla, se
@@ -214,6 +218,124 @@ pub struct RawDisk {
     synthesized: bool,
 }
 
+// -------------------------------------------------- puerta de montaje --------
+
+/// Clave del DISCO FÍSICO a partir del nombre de un dispositivo o partición:
+/// `rdisk2`→`disk2`, `disk2s1`→`disk2`, `sda3`→`sda`, `nvme0n1p2`→`nvme0n1`,
+/// `mmcblk0p1`→`mmcblk0`. Se usa para comparar montajes: si una partición de
+/// un disco está montada, escribir patrones en CUALQUIER sector de ese disco
+/// compite con el sistema de archivos.
+pub(crate) fn disk_key(name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let mut k: String = match base.strip_prefix("rdisk") {
+        Some(rest) => format!("disk{rest}"),
+        None => base.to_string(),
+    };
+    loop {
+        // Sufijo de partición con marcador: …sN / …pN (macOS, NVMe, mmc).
+        if let Some(pos) = k.rfind(['s', 'p']) {
+            let suffix = &k[pos + 1..];
+            if !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()) {
+                k.truncate(pos);
+                continue;
+            }
+        }
+        break;
+    }
+    // Discos ATA clásicos: sda3 → sda (la letra de unidad se conserva).
+    if k.starts_with("sd") || k.starts_with("hd") || k.starts_with("vd") {
+        let letters = k.trim_end_matches(|c: char| c.is_ascii_digit());
+        if letters != k && !letters.is_empty() {
+            k = letters.to_string();
+        }
+    }
+    k
+}
+
+/// Tabla de montajes del sistema: (dispositivo, punto de montaje). Linux lee
+/// `/proc/mounts`; macOS consulta `mount -p`. Otros SO devuelven vacío (la
+/// puerta del montaje simplemente no puede demostrar nada ahí).
+fn mount_table() -> Vec<(String, String)> {
+    let parse = |text: &str| -> Vec<(String, String)> {
+        text.lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let dev = it.next()?;
+                // Linux: `dev punto fstype…`; macOS (`mount -p`): `dev on punto…`.
+                let second = it.next()?;
+                let mp = if second == "on" { it.next()? } else { second };
+                Some((dev.to_string(), mp.to_string()))
+            })
+            .collect()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_to_string("/proc/mounts").map(|t| parse(&t)).unwrap_or_default();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("mount").arg("-p").output() {
+            Ok(o) if o.status.success() => parse(&String::from_utf8_lossy(&o.stdout)),
+            _ => Vec::new(),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = parse;
+        Vec::new()
+    }
+}
+
+/// ¿El dispositivo `dev` (o cualquier partición de su disco físico) está
+/// montado? Devuelve el punto de montaje encontrado.
+pub(crate) fn mounted_overlap_with(dev_name: &str, table: &[(String, String)]) -> Option<String> {
+    let key = disk_key(dev_name);
+    for (device, mountpoint) in table {
+        if device == dev_name || (!key.is_empty() && disk_key(device) == key) {
+            return Some(mountpoint.clone());
+        }
+    }
+    None
+}
+
+pub(crate) fn mounted_overlap(dev: &Path) -> Option<String> {
+    // Una ruta tipo /dev/disk/by-partuuid/… se resuelve al nodo real del disco.
+    let real = std::fs::canonicalize(dev).unwrap_or_else(|_| dev.to_path_buf());
+    mounted_overlap_with(&real.to_string_lossy(), &mount_table())
+}
+
+/// Banderas de apertura de Linux (asm-generic/fcntl.h). El test
+/// `linux_numeros_de_apertura_e_ioctls_derivados` los deriva de la
+/// codificación oficial: ojo, `O_SYNC` NO es `0o4000` (eso es O_NONBLOCK).
+#[cfg(target_os = "linux")]
+const LINUX_O_EXCL: i32 = 0o0000200;
+#[cfg(target_os = "linux")]
+const LINUX_O_DIRECT: i32 = 0o0040000;
+#[cfg(target_os = "linux")]
+const LINUX_O_SYNC: i32 = 0o4010000; // __O_SYNC (0o4000000) | O_DSYNC (0o10000)
+
+/// Ioctls de bloque de Linux (linux/fs.h), codificación `_IO(major, nr)`.
+#[cfg(target_os = "linux")]
+const LINUX_BLKFLSBUF: u64 = 0x1261; // _IO(0x12, 97)
+#[cfg(target_os = "linux")]
+const LINUX_BLKROGET: u64 = 0x127D; // _IO(0x12, 125)
+
+/// Linux: convierte el EBUSY (16) de la apertura exclusiva en un mensaje
+/// útil — el disco está montado o retenido en exclusivo por otro usuario.
+#[cfg(target_os = "linux")]
+fn linux_open_err(path: &Path, write: bool, e: std::io::Error) -> std::io::Error {
+    if write && e.raw_os_error() == Some(16) {
+        return std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} está en uso (montado o retenido en exclusivo por el sistema): regrow jamás escribe sobre un dispositivo así — desmóntalo o trabaja sobre una imagen",
+                path.display()
+            ),
+        );
+    }
+    e
+}
+
 impl RawDisk {
     /// Ruta nativa de la unidad física N según el SO.
     /// En Linux la convención `sdX` es heurística: para `nvme*`/`mmcblk*`
@@ -233,12 +355,29 @@ impl RawDisk {
         name
     }
 
-    /// Abre el dispositivo crudo. `write=true` para repair/regenerate.
+    /// Abre el dispositivo crudo. `write=true` para repair/regenerate/testwrite.
     /// Acepta bloques físicos 512/1024/2048/4096 (4Kn con
     /// lectura-modificación-escritura). En Linux intenta `O_DIRECT` (bypass
     /// del page cache) y en Windows `FILE_FLAG_NO_BUFFERING`; si el probe
     /// falla, se reabre sin la bandera estricta.
+    ///
+    /// Toda apertura de ESCRITURA pasa la puerta de montaje (ningún SO
+    /// permite escribir sobre un disco que participa en un montaje vivo); en
+    /// Linux el kernel la refuerza con `O_EXCL` (EBUSY si el dispositivo está
+    /// montado o retenido en exclusivo) y `BLKROGET` (bloqueo físico).
     pub fn open(path: &Path, write: bool) -> io::Result<Self> {
+        if write {
+            if let Some(mp) = mounted_overlap(path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} participa en el montaje {}: regrow no escribe sobre un disco montado (desmóntalo primero o trabaja sobre una imagen)",
+                        path.display(),
+                        mp
+                    ),
+                ));
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             match Self::open_with(path, write, true) {
@@ -287,16 +426,23 @@ impl RawDisk {
                 use std::os::unix::fs::OpenOptionsExt;
                 let mut flags = 0i32;
                 if strict {
-                    flags |= 0o00040000; // O_DIRECT: bypass del page cache
+                    flags |= LINUX_O_DIRECT; // bypass del page cache
                 }
                 if write {
-                    flags |= 0o0004000; // O_SYNC: las reescrituras llegan al medio
+                    // O_SYNC real: cada escritura llega al medio antes de
+                    // devolver (el 0o4000 que usábamos era O_NONBLOCK).
+                    // O_EXCL: apertura exclusiva — el kernel responde EBUSY
+                    // si el disco está montado o retenido en exclusivo.
+                    flags |= LINUX_O_SYNC | LINUX_O_EXCL;
                 }
                 if flags != 0 {
                     opts.custom_flags(flags);
                 }
             }
-            opts.open(path)?
+            let opened = opts.open(path);
+            #[cfg(target_os = "linux")]
+            let opened = opened.map_err(|e| linux_open_err(path, write, e));
+            opened?
         };
         #[cfg(windows)]
         let file = windows_open(path, write, strict)?;
@@ -334,6 +480,25 @@ impl RawDisk {
                     phys
                 ),
             ));
+        }
+
+        // Linux: si el medio se declara protegido contra escritura (bloqueo
+        // físico de una tarjeta, hook del kernel), mejor decirlo aquí que
+        // descubrirlo a media pasada destructiva.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let mut ro = 0i32;
+            if write && unsafe { ioctl(file.as_raw_fd(), LINUX_BLKROGET, &mut ro) } == 0 && ro != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} está protegido contra escritura (bloqueo físico del medio): no se puede escribir en él",
+                        path.display()
+                    ),
+                ));
+            }
         }
 
         // macOS: bypass de la caché de búfer (F_NOCACHE) tras abrir.
@@ -377,6 +542,21 @@ impl RawDisk {
             got += n;
         }
         Ok(())
+    }
+
+    /// Linux BLKFLSBUF: vacía e invalida la caché de bloques del kernel para
+    /// este dispositivo. Sin esto, un lector posterior (nuestra propia
+    /// verificación, el SO al remontar, otra herramienta) puede seguir
+    /// viendo el contenido ANTERIOR a nuestras reescrituras crudas. Es la
+    /// lección de seguridad que TestDisk aplica desde hace años. El error se
+    /// ignora deliberadamente: los nodos que no lo soportan (ciertos puentes
+    /// USB) ya escriben con O_DIRECT/O_SYNC y no dejan caché rancia.
+    #[cfg(target_os = "linux")]
+    fn flush_bufs(&self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            ioctl(self.file.as_raw_fd(), LINUX_BLKFLSBUF, 0);
+        }
     }
 
     /// Bloque físico confirmado (512|1024|2048|4096).
@@ -445,7 +625,7 @@ impl SectorSource for RawDisk {
         if self.phys == SECTOR_SIZE {
             self.bulk.0[..SECTOR_SIZE].copy_from_slice(buf);
             self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
-            self.file.write_all(&self.bulk.0[..SECTOR_SIZE])
+            self.file.write_all(&self.bulk.0[..SECTOR_SIZE])?;
         } else {
             // 4Kn: lectura-modificación-escritura del bloque físico: los
             // sectores lógicos vecinos se preservan. Si el bloque está
@@ -457,8 +637,13 @@ impl SectorSource for RawDisk {
             self.file.read_exact(&mut self.bulk.0[..self.phys])?;
             self.bulk.0[off..off + SECTOR_SIZE].copy_from_slice(buf);
             self.file.seek(SeekFrom::Start(blk * self.phys as u64))?;
-            self.file.write_all(&self.bulk.0[..self.phys])
+            self.file.write_all(&self.bulk.0[..self.phys])?;
         }
+        // La escritura ya está en el medio (O_SYNC/O_DIRECT); invalida la
+        // caché del kernel para que nadie vea el contenido viejo.
+        #[cfg(target_os = "linux")]
+        self.flush_bufs();
+        Ok(())
     }
 
     /// Bloque bulk. En modo estricto (O_DIRECT / NO_BUFFERING / 4Kn) toda la
@@ -506,8 +691,12 @@ impl SectorSource for RawDisk {
 
 impl Drop for RawDisk {
     fn drop(&mut self) {
-        // Vaciado de los sectores reescritos antes de cerrar el dispositivo.
+        // Vaciado de los sectores reescritos antes de cerrar el dispositivo
+        // y adiós a la caché rancia del kernel (por si el fd se cerró antes
+        // de cualquier verificación posterior).
         let _ = self.file.sync_all();
+        #[cfg(target_os = "linux")]
+        self.flush_bufs();
     }
 }
 
@@ -1086,6 +1275,56 @@ mod tests {
         assert_eq!(ior(b'd' as u64, 24, 4), 0x4004_6418); // DKIOCGETBLOCKSIZE
         assert_eq!(ior(b'd' as u64, 25, 8), 0x4008_6419); // DKIOCGETBLOCKCOUNT
         assert_eq!(ior(b'd' as u64, 77, 4), 0x4004_644D); // DKIOCGETPHYSICALBLOCKSIZE
+    }
+
+    /// Regresión: las banderas de apertura y los ioctls de bloque de Linux se
+    /// derivan de la codificación oficial (asm-generic/fcntl.h, linux/fs.h).
+    /// El número que usábamos como O_SYNC era en realidad O_NONBLOCK: este
+    /// test fija la familia para siempre. Verificado contra los valores que
+    /// entrega el kernel en tiempo de ejecución.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_numeros_de_apertura_e_ioctls_derivados() {
+        // _IO(major, nr) = major<<8 | nr ;
+        // _IOR = _IOC_READ (2)<<30 | sizeof(t)<<16 | major<<8 | nr
+        let io = |major: u64, nr: u64| (major << 8) | nr;
+        let ior = |major: u64, nr: u64, size: u64| (2u64 << 30) | (size << 16) | io(major, nr);
+        assert_eq!(io(0x12, 104), 0x1268); // BLKSSZGET (device_sector_size)
+        assert_eq!(ior(0x12, 114, 8), 0x8008_1272); // BLKGETSIZE64 (device_size)
+        assert_eq!(io(0x12, 97), LINUX_BLKFLSBUF); // BLKFLSBUF
+        assert_eq!(io(0x12, 125), LINUX_BLKROGET); // BLKROGET
+        assert_eq!(LINUX_O_EXCL, 0o200);
+        assert_eq!(LINUX_O_DIRECT, 0o40000);
+        assert_eq!(LINUX_O_SYNC, 0o4000000 | 0o10000); // __O_SYNC | O_DSYNC
+        assert_ne!(LINUX_O_SYNC, 0o4000); // 0o4000 es O_NONBLOCK: la trampa clásica
+    }
+
+    /// La puerta del montaje reconoce el disco completo y cualquier
+    /// partición suya (si una partición está montada, NO se escribe en el
+    /// disco entero).
+    #[test]
+    fn mounted_overlap_detecta_disco_o_cualquier_particion() {
+        let table = vec![
+            ("/dev/disk2s1".to_string(), "/".to_string()),
+            ("/dev/disk3s2".to_string(), "/mnt/extra".to_string()),
+        ];
+        assert_eq!(mounted_overlap_with("/dev/rdisk2", &table).as_deref(), Some("/"));
+        assert_eq!(mounted_overlap_with("/dev/disk2", &table).as_deref(), Some("/"));
+        assert_eq!(mounted_overlap_with("/dev/disk2s7", &table).as_deref(), Some("/"));
+        assert_eq!(mounted_overlap_with("/dev/disk3", &table).as_deref(), Some("/mnt/extra"));
+        assert_eq!(mounted_overlap_with("/dev/rdisk4", &table), None);
+    }
+
+    #[test]
+    fn disk_key_unifica_disco_y_particiones() {
+        assert_eq!(disk_key("/dev/rdisk2"), "disk2");
+        assert_eq!(disk_key("/dev/disk2"), "disk2");
+        assert_eq!(disk_key("/dev/disk2s1"), "disk2");
+        assert_eq!(disk_key("/dev/sda3"), "sda");
+        assert_eq!(disk_key("/dev/sda"), "sda");
+        assert_eq!(disk_key("/dev/nvme0n1"), "nvme0n1");
+        assert_eq!(disk_key("/dev/nvme0n1p2"), "nvme0n1");
+        assert_eq!(disk_key("/dev/mmcblk0p1"), "mmcblk0");
     }
 
     #[test]

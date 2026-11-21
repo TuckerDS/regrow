@@ -49,7 +49,7 @@ use engine::{
 };
 use log::{format_asctime, format_hms, merge_logs, rotate_log_chain, write_log, DiskLog, Flag, Record};
 use smart::{print_status, query as smart_query, TemperatureGuard};
-use source::{FileImage, MediaKind, RawDisk, SectorSource};
+use source::{mounted_overlap, FileImage, MediaKind, RawDisk, SectorSource};
 use speed::{run_speedtest, SPEED_CHUNK};
 use state::{load_pending, resume_note, resume_plan, state_path, Checkpoint};
 
@@ -1620,90 +1620,6 @@ fn wear_note(si: &smart::SmartInfo) -> String {
     )
 }
 
-/// Clave del DISCO FÍSICO a partir del nombre de un dispositivo o partición:
-/// `rdisk2`→`disk2`, `disk2s1`→`disk2`, `sda3`→`sda`, `nvme0n1p2`→`nvme0n1`,
-/// `mmcblk0p1`→`mmcblk0`. Se usa para comparar montajes: si una partición de
-/// un disco está montada, escribir patrones en CUALQUIER sector de ese disco
-/// compite con el sistema de archivos.
-pub(crate) fn disk_key(name: &str) -> String {
-    let base = name.rsplit('/').next().unwrap_or(name);
-    let mut k: String = match base.strip_prefix("rdisk") {
-        Some(rest) => format!("disk{rest}"),
-        None => base.to_string(),
-    };
-    loop {
-        // Sufijo de partición con marcador: …sN / …pN (macOS, NVMe, mmc).
-        if let Some(pos) = k.rfind(['s', 'p']) {
-            let suffix = &k[pos + 1..];
-            if !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()) {
-                k.truncate(pos);
-                continue;
-            }
-        }
-        break;
-    }
-    // Discos ATA clásicos: sda3 → sda (la letra de unidad se conserva).
-    if k.starts_with("sd") || k.starts_with("hd") || k.starts_with("vd") {
-        let letters = k.trim_end_matches(|c: char| c.is_ascii_digit());
-        if letters != k && !letters.is_empty() {
-            k = letters.to_string();
-        }
-    }
-    k
-}
-
-/// Tabla de montajes del sistema: (dispositivo, punto de montaje). Linux lee
-/// `/proc/mounts`; macOS consulta `mount -p`. Otros SO devuelven vacío (la
-/// puerta del montaje simplemente no puede demostrar nada ahí).
-fn mount_table() -> Vec<(String, String)> {
-    let parse = |text: &str| -> Vec<(String, String)> {
-        text.lines()
-            .filter_map(|l| {
-                let mut it = l.split_whitespace();
-                let dev = it.next()?;
-                // Linux: `dev punto fstype…`; macOS (`mount -p`): `dev on punto…`.
-                let second = it.next()?;
-                let mp = if second == "on" { it.next()? } else { second };
-                Some((dev.to_string(), mp.to_string()))
-            })
-            .collect()
-    };
-    #[cfg(target_os = "linux")]
-    {
-        return std::fs::read_to_string("/proc/mounts").map(|t| parse(&t)).unwrap_or_default();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        match std::process::Command::new("mount").arg("-p").output() {
-            Ok(o) if o.status.success() => parse(&String::from_utf8_lossy(&o.stdout)),
-            _ => Vec::new(),
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = parse;
-        Vec::new()
-    }
-}
-
-/// ¿El dispositivo `dev` (o cualquier partición de su disco físico) está
-/// montado? Devuelve el punto de montaje encontrado.
-pub(crate) fn mounted_overlap_with(dev_name: &str, table: &[(String, String)]) -> Option<String> {
-    let key = disk_key(dev_name);
-    for (device, mountpoint) in table {
-        if device == dev_name || (!key.is_empty() && disk_key(device) == key) {
-            return Some(mountpoint.clone());
-        }
-    }
-    None
-}
-
-fn mounted_overlap(dev: &Path) -> Option<String> {
-    // Una ruta tipo /dev/disk/by-partuuid/… se resuelve al nodo real del disco.
-    let real = std::fs::canonicalize(dev).unwrap_or_else(|_| dev.to_path_buf());
-    mounted_overlap_with(&real.to_string_lossy(), &mount_table())
-}
-
 /// Severidad para agregar celdas al comprimir la barra (WriteFail y Bad mandan
 /// sobre Delay/Rec/Scan/Empty; marginal manda sobre las bandas lentas de su
 /// entorno: T1 < marginal < T3 < T4; las bandas se ordenan T1 < T2 < T3 < T4).
@@ -2785,34 +2701,8 @@ mod tests {
         assert_eq!(o.image.as_deref(), Some(Path::new("img.raw")));
     }
 
-    // ---- Puertas de `testwrite` y detección de montaje (M16) ----
-
-    #[test]
-    fn disk_key_unifica_disco_y_particiones() {
-        assert_eq!(disk_key("/dev/rdisk2"), "disk2");
-        assert_eq!(disk_key("/dev/disk2"), "disk2");
-        assert_eq!(disk_key("/dev/disk2s1"), "disk2");
-        assert_eq!(disk_key("/dev/sda3"), "sda");
-        assert_eq!(disk_key("/dev/sda"), "sda");
-        assert_eq!(disk_key("/dev/nvme0n1"), "nvme0n1");
-        assert_eq!(disk_key("/dev/nvme0n1p2"), "nvme0n1");
-        assert_eq!(disk_key("/dev/mmcblk0p1"), "mmcblk0");
-    }
-
-    #[test]
-    fn mounted_overlap_detecta_disco_o_cualquier_particion() {
-        let table = vec![
-            ("/dev/disk2s1".to_string(), "/".to_string()),
-            ("/dev/disk3s5".to_string(), "/mnt/extra".to_string()),
-        ];
-        // El disco entero: una de sus particiones montada basta para bloquear.
-        assert_eq!(mounted_overlap_with("/dev/rdisk2", &table).as_deref(), Some("/"));
-        // Otra partición (aunque no esté montada) del mismo disco físico también.
-        assert_eq!(mounted_overlap_with("/dev/disk2s7", &table).as_deref(), Some("/"));
-        assert_eq!(mounted_overlap_with("/dev/rdisk3", &table).as_deref(), Some("/mnt/extra"));
-        // Un disco sin montajes sí deja trabajar.
-        assert_eq!(mounted_overlap_with("/dev/rdisk4", &table), None);
-    }
+    // ---- Puertas de `testwrite` (M16; la detección de montaje vive ahora en
+    // la capa de dispositivo, con sus tests en source.rs) ----
 
     /// Imagen de prueba con contenido reconocible (no todo-cero).
     fn fixture_image(dir: &Path, sectors: u64) -> PathBuf {
