@@ -6,6 +6,21 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Added
+
+- `rescue`: controles de ritmo al estilo ddrescue. `--rate-limit B` techo de
+  bytes/s copiados a la imagen (sufijos K/M; `off`); al superarlo en una
+  ventana de 1 s el rescate duerme hasta cerrarla — para convivir con una
+  máquina en producción. `--min-read-rate N|auto`: en la fase directa, un
+  bloque que se lee más despacio de N bytes/s (con `auto`, un décimo del
+  ritmo medio alcanzado) NO se copia en ese momento: se avisa, queda
+  pendiente y lo retrabajan las fases lentas (división/rascado), que sí
+  aceptan lecturas lentas — la pasada rápida no acampa sobre la zona mala y
+  ningún dato leído se descarta nunca. `--max-error-rate B`: si los intentos
+  de lectura fallidos superan B bytes/s sostenidos, el rescate se detiene
+  con el mapfile guardado. La línea de estado ahora muestra el ritmo
+  (KiB/s) y los bloques lentos diferidos; el resumen los contabiliza.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added

@@ -52,6 +52,22 @@ impl Phase {
     }
 }
 
+/// Política de «zona lenta» de la fase directa (al estilo ddrescue `-a`).
+/// Un bloque que se lee más despacio del umbral NO se copia en ese momento:
+/// queda pendiente y lo retrabajan las fases lentas (división y rascado),
+/// que sí aceptan lecturas lentas — así la pasada rápida no acampa sobre la
+/// zona mala, pero ningún dato leído se pierde jamás.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinRate {
+    /// Desactivado (comportamiento por defecto).
+    Off,
+    /// Umbral = un décimo del ritmo medio de copia alcanzado hasta ahora
+    /// (suelo 1 KiB/s, como el `auto` de ddrescue).
+    Auto,
+    /// Umbral explícito, en bytes/s.
+    Bytes(u64),
+}
+
 #[derive(Clone, Debug)]
 pub struct RescueOptions {
     pub start: u64,
@@ -72,6 +88,18 @@ pub struct RescueOptions {
     /// Sidecar disperso donde respaldar cada sector ANTES de sobrescribirlo
     /// en la imagen (None = sin respaldo; la regla de campo pide uno).
     pub backup: Option<PathBuf>,
+    /// Techo de bytes/s copiados a la imagen (estilo ddrescue `-Z`): al
+    /// superarlo en una ventana de 1 s, el rescate duerme hasta cerrarla.
+    /// Sirve para convivir con una máquina en producción. None = sin techo.
+    pub rate_limit: Option<u64>,
+    /// Política de zona lenta en la FASE DIRECTA (estilo ddrescue `-a`): ver
+    /// `MinRate`. Las fases lentas (división/rascado) siempre aceptan lo que
+    /// se pueda leer, por lento que sea — nunca se descarta un dato leído.
+    pub min_read_rate: MinRate,
+    /// Aborto protector: si los INTENTOS de lectura fallidos superan esta
+    /// tasa (bytes/s en ventana de 1 s), el rescate se detiene con el
+    /// mapfile guardado. None = desactivado.
+    pub max_error_rate: Option<u64>,
 }
 
 impl Default for RescueOptions {
@@ -87,6 +115,9 @@ impl Default for RescueOptions {
             max_temp: None,
             device: None,
             backup: None,
+            rate_limit: None,
+            min_read_rate: MinRate::Off,
+            max_error_rate: None,
         }
     }
 }
@@ -101,6 +132,8 @@ pub struct RescueReport {
     pub blocks_ok: u64,
     #[allow(dead_code)]
     pub block_errors: u64,
+    /// Bloques que la fase directa declaró lentos y difirió a las fases lentas.
+    pub slow_deferred: u64,
     pub seconds: u64,
 }
 
@@ -112,6 +145,9 @@ pub struct Progress {
     pub pending: u64,
     pub blocks_ok: u64,
     pub block_errors: u64,
+    /// Bytes efectivamente copiados a la imagen en esta corrida (para el ritmo).
+    pub copied_bytes: u64,
+    pub slow_deferred: u64,
 }
 
 /// Crea (o valida) la imagen sparse: tamaño exacto del origen para que el
@@ -143,8 +179,75 @@ enum TryErr {
     /// Fallo de lectura del origen: normal en el rescate (lo reintenta la
     /// fase correspondiente); se conserva para diagnósticos futuros.
     Read(#[allow(dead_code)] io::Error),
+    /// La lectura terminó bien pero tardó más que el presupuesto de la fase
+    /// directa (`--min-read-rate`): el bloque NO se copia ahora; lo retrabajan
+    /// las fases lentas. Lleva la tardanza real para el aviso.
+    Slow(Duration),
     /// Fallo del respaldo o de la escritura en la imagen: aborta el rescate.
     Fatal(io::Error),
+}
+
+/// Ventana de 1 s para el techo de tasa (`--rate-limit`): al pasarse del
+/// límite, devuelve cuánto hay que dormir para cerrar la ventana.
+struct Throttle {
+    limit: u64,
+    win_start: Option<Instant>,
+    bytes: u64,
+}
+
+impl Throttle {
+    fn feed(&mut self, now: Instant, b: u64) -> Option<Duration> {
+        match self.win_start {
+            None => {
+                self.win_start = Some(now);
+                self.bytes = b;
+                None
+            }
+            Some(t) => {
+                let el = now.duration_since(t);
+                if el >= Duration::from_secs(1) {
+                    self.win_start = Some(now);
+                    self.bytes = b;
+                    return None;
+                }
+                self.bytes = self.bytes.saturating_add(b);
+                if self.bytes > self.limit {
+                    let rest_ns = 1_000_000_000u128.saturating_sub(el.as_nanos());
+                    Some(Duration::from_millis((rest_ns / 1_000_000).max(1).min(5000) as u64))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Ventana de 1 s para la tasa máxima de intentos fallidos
+/// (`--max-error-rate`): `true` = se superó el umbral (abortar).
+struct ErrMeter {
+    limit: u64,
+    win_start: Option<Instant>,
+    bytes: u64,
+}
+
+impl ErrMeter {
+    fn feed(&mut self, now: Instant, b: u64) -> bool {
+        match self.win_start {
+            None => {
+                self.win_start = Some(now);
+                self.bytes = b;
+            }
+            Some(t) => {
+                if now.duration_since(t) >= Duration::from_secs(1) {
+                    self.win_start = Some(now);
+                    self.bytes = b;
+                } else {
+                    self.bytes = self.bytes.saturating_add(b);
+                }
+            }
+        }
+        self.bytes > self.limit
+    }
 }
 
 /// Respaldo sector a sector ANTES de sobrescribir: un sidecar disperso
@@ -189,6 +292,10 @@ impl Drop for ImageBackup {
 /// Copia el bloque `src → img` solo después de respaldar en `bak` el contenido
 /// que la imagen tiene ahora en ese rango. Orden deliberado: primero se LEE
 /// el origen (si falla, no hay nada que escribir ni respaldar).
+/// `slow_over`: presupuesto de lectura de la fase directa; si la lectura
+/// termina bien pero tardó más que el presupuesto, el bloque se declara
+/// `Slow` ANTES de respaldar o escribir (la imagen no se toca). Devuelve la
+/// duración real de la lectura.
 fn try_block(
     src: &mut dyn SectorSource,
     img: &mut FileImage,
@@ -197,9 +304,17 @@ fn try_block(
     n: usize,
     buf: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
-) -> Result<(), TryErr> {
+    slow_over: Option<Duration>,
+) -> Result<Duration, TryErr> {
     buf.resize(n * SECTOR_SIZE, 0);
+    let t = Instant::now();
     src.read_chunk(lba, n, buf).map_err(TryErr::Read)?;
+    let dur = t.elapsed();
+    if let Some(bud) = slow_over {
+        if dur > bud {
+            return Err(TryErr::Slow(dur));
+        }
+    }
     if let Some(b) = bak {
         scratch.resize(n * SECTOR_SIZE, 0);
         img.read_chunk(lba, n, scratch).map_err(TryErr::Fatal)?;
@@ -207,7 +322,7 @@ fn try_block(
             .map_err(TryErr::Fatal)?;
     }
     img.write_chunk(lba, n, buf).map_err(TryErr::Fatal)?;
-    Ok(())
+    Ok(dur)
 }
 
 fn emit_progress<F: FnMut(&Progress)>(
@@ -217,6 +332,8 @@ fn emit_progress<F: FnMut(&Progress)>(
     cur: u64,
     blocks_ok: u64,
     block_errors: u64,
+    copied_bytes: u64,
+    slow_deferred: u64,
 ) {
     let (g, f, s, u) = map.stats();
     on_progress(&Progress {
@@ -226,6 +343,8 @@ fn emit_progress<F: FnMut(&Progress)>(
         pending: f + s + u,
         blocks_ok,
         block_errors,
+        copied_bytes,
+        slow_deferred,
     });
 }
 
@@ -245,6 +364,8 @@ pub fn run_rescue(
     let mut ops = 0usize;
     let mut last_save = Instant::now();
     let mut last_temp = Instant::now();
+    let mut copied_bytes = 0u64;
+    let mut slow_deferred = 0u64;
 
     // El respaldo se abre ANTES de tocar nada: si no se puede crear el
     // sidecar, el rescate ni siquiera empieza.
@@ -258,6 +379,39 @@ pub fn run_rescue(
         if opts.retry_wait > Duration::ZERO {
             thread::sleep(opts.retry_wait.min(Duration::from_secs(30)));
         }
+    };
+
+    // Techos de ritmo y de errores (ventanas de 1 s).
+    let mut throttle = opts.rate_limit.map(|l| Throttle {
+        limit: l,
+        win_start: None,
+        bytes: 0,
+    });
+    let mut errmeter = opts.max_error_rate.map(|l| ErrMeter {
+        limit: l,
+        win_start: None,
+        bytes: 0,
+    });
+    // Un fallo que cruza la tasa máxima detiene el rescate con el mapa a salvo.
+    let rate_abort = || {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "tasa máxima de errores superada — rescate detenido con el mapfile guardado (sube --max-error-rate u omítelo para seguir insistiendo)",
+        )
+    };
+    // Presupuesto de lectura de la fase directa según --min-read-rate.
+    let slow_budget = |n: usize, copied: u64, elapsed: Duration| -> Option<Duration> {
+        let rate: u64 = match opts.min_read_rate {
+            MinRate::Off => return None,
+            MinRate::Bytes(r) => r.max(1),
+            MinRate::Auto => {
+                let avg = copied / elapsed.as_secs().max(1);
+                (avg / 10).max(1024)
+            }
+        };
+        Some(Duration::from_millis(
+            ((n as u64 * SECTOR_SIZE as u64 * 1000) / rate).max(1),
+        ))
     };
 
     let mut maybe_save = |map: &mut MapFile, ops: &mut usize, last_save: &mut Instant| -> io::Result<()> {
@@ -319,14 +473,37 @@ pub fn run_rescue(
         let mut pos = a;
         while pos < a + len {
             let n = opts.block.min((a + len - pos) as usize).max(1);
-            match try_block(src, img, bak.as_mut(), pos, n, &mut buf, &mut scratch) {
-                Ok(()) => {
+            let budget = slow_budget(n, copied_bytes, t0.elapsed());
+            match try_block(src, img, bak.as_mut(), pos, n, &mut buf, &mut scratch, budget) {
+                Ok(_) => {
                     map.set(pos, n as u64, MapStatus::Good, 0);
                     blocks_ok += 1;
+                    copied_bytes += n as u64 * SECTOR_SIZE as u64;
+                    if let Some(t) = throttle.as_mut() {
+                        if let Some(d) = t.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
+                            thread::sleep(d);
+                        }
+                    }
+                }
+                Err(TryErr::Slow(dur)) => {
+                    slow_deferred += 1;
+                    if let Some(bud) = budget {
+                        eprintln!(
+                            "aviso: bloque de {n} sectores en {pos} leído en {} ms (umbral {} ms): diferido a las fases lentas",
+                            dur.as_millis(),
+                            bud.as_millis()
+                        );
+                    }
                 }
                 Err(TryErr::Read(_)) => {
                     map.set(pos, n as u64, MapStatus::Failed, 0);
                     block_errors += 1;
+                    if let Some(m) = errmeter.as_mut() {
+                        if m.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
+                            map.save(map_path)?;
+                            return Err(rate_abort());
+                        }
+                    }
                     rest(&opts);
                 }
                 Err(TryErr::Fatal(e)) => {
@@ -336,7 +513,7 @@ pub fn run_rescue(
             }
             pos += n as u64;
             maybe_save(map, &mut ops, &mut last_save)?;
-            emit_progress(map, &mut on_progress, Phase::Direct, pos, blocks_ok, block_errors);
+            emit_progress(map, &mut on_progress, Phase::Direct, pos, blocks_ok, block_errors, copied_bytes, slow_deferred);
         }
     }
     map.save(map_path)?;
@@ -358,14 +535,27 @@ pub fn run_rescue(
                 if sl == 0 {
                     continue;
                 }
-                match try_block(src, img, bak.as_mut(), sa, sl as usize, &mut buf, &mut scratch) {
-                    Ok(()) => {
+                match try_block(src, img, bak.as_mut(), sa, sl as usize, &mut buf, &mut scratch, None) {
+                    Ok(_) => {
                         map.set(sa, sl, MapStatus::Good, 0);
                         blocks_ok += 1;
+                        copied_bytes += sl * SECTOR_SIZE as u64;
+                        if let Some(t) = throttle.as_mut() {
+                            if let Some(d) = t.feed(Instant::now(), sl * SECTOR_SIZE as u64) {
+                                thread::sleep(d);
+                            }
+                        }
                     }
+                    Err(TryErr::Slow(_)) => unreachable!(), // sin presupuesto en las fases lentas
                     Err(TryErr::Read(_)) => {
                         map.set(sa, sl, MapStatus::Failed, 0);
                         block_errors += 1;
+                        if let Some(m) = errmeter.as_mut() {
+                            if m.feed(Instant::now(), sl * SECTOR_SIZE as u64) {
+                                map.save(map_path)?;
+                                return Err(rate_abort());
+                            }
+                        }
                         rest(&opts);
                     }
                     Err(TryErr::Fatal(e)) => {
@@ -374,7 +564,7 @@ pub fn run_rescue(
                     }
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
-                emit_progress(map, &mut on_progress, Phase::Split, sa + sl, blocks_ok, block_errors);
+                emit_progress(map, &mut on_progress, Phase::Split, sa + sl, blocks_ok, block_errors, copied_bytes, slow_deferred);
             }
         }
     }
@@ -392,16 +582,29 @@ pub fn run_rescue(
     for lba in singles {
             let mut recovered = false;
             for attempt in 1..=opts.retries.max(1) {
-                match try_block(src, img, bak.as_mut(), lba, 1, &mut buf, &mut scratch) {
-                    Ok(()) => {
+                match try_block(src, img, bak.as_mut(), lba, 1, &mut buf, &mut scratch, None) {
+                    Ok(_) => {
                         map.set(lba, 1, MapStatus::Good, attempt - 1);
                         blocks_ok += 1;
+                        copied_bytes += SECTOR_SIZE as u64;
+                        if let Some(t) = throttle.as_mut() {
+                            if let Some(d) = t.feed(Instant::now(), SECTOR_SIZE as u64) {
+                                thread::sleep(d);
+                            }
+                        }
                         recovered = true;
                         break;
                     }
+                    Err(TryErr::Slow(_)) => unreachable!(), // sin presupuesto en las fases lentas
                     Err(TryErr::Read(_)) => {
                         map.set(lba, 1, MapStatus::Failed, attempt as u8);
                         block_errors += 1;
+                        if let Some(m) = errmeter.as_mut() {
+                            if m.feed(Instant::now(), SECTOR_SIZE as u64) {
+                                map.save(map_path)?;
+                                return Err(rate_abort());
+                            }
+                        }
                         // pausa entre tentativas del mismo sector (no tras la última)
                         if attempt < opts.retries.max(1) {
                             rest(&opts);
@@ -417,7 +620,7 @@ pub fn run_rescue(
                 map.set(lba, 1, MapStatus::Scraped, opts.retries.max(1));
             }
             maybe_save(map, &mut ops, &mut last_save)?;
-            emit_progress(map, &mut on_progress, Phase::Scrape, lba, blocks_ok, block_errors);
+            emit_progress(map, &mut on_progress, Phase::Scrape, lba, blocks_ok, block_errors, copied_bytes, slow_deferred);
         }
     map.save(map_path)?;
 
@@ -429,13 +632,26 @@ pub fn run_rescue(
             while pos_ex > a {
                 let n = opts.block.min((pos_ex - a) as usize).max(1);
                 pos_ex -= n as u64;
-                match try_block(src, img, bak.as_mut(), pos_ex, n, &mut buf, &mut scratch) {
-                    Ok(()) => {
+                match try_block(src, img, bak.as_mut(), pos_ex, n, &mut buf, &mut scratch, None) {
+                    Ok(_) => {
                         map.set(pos_ex, n as u64, MapStatus::Good, 0);
                         blocks_ok += 1;
+                        copied_bytes += n as u64 * SECTOR_SIZE as u64;
+                        if let Some(t) = throttle.as_mut() {
+                            if let Some(d) = t.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
+                                thread::sleep(d);
+                            }
+                        }
                     }
+                    Err(TryErr::Slow(_)) => unreachable!(), // sin presupuesto en las fases lentas
                     Err(TryErr::Read(_)) => {
                         block_errors += 1;
+                        if let Some(m) = errmeter.as_mut() {
+                            if m.feed(Instant::now(), n as u64 * SECTOR_SIZE as u64) {
+                                map.save(map_path)?;
+                                return Err(rate_abort());
+                            }
+                        }
                         rest(&opts);
                     }
                     Err(TryErr::Fatal(e)) => {
@@ -444,7 +660,7 @@ pub fn run_rescue(
                     }
                 }
                 maybe_save(map, &mut ops, &mut last_save)?;
-                emit_progress(map, &mut on_progress, Phase::Reverse, pos_ex, blocks_ok, block_errors);
+                emit_progress(map, &mut on_progress, Phase::Reverse, pos_ex, blocks_ok, block_errors, copied_bytes, slow_deferred);
             }
         }
     }
@@ -458,6 +674,7 @@ pub fn run_rescue(
         untried,
         blocks_ok,
         block_errors,
+        slow_deferred,
         seconds: t0.elapsed().as_secs(),
     })
 }
@@ -478,6 +695,7 @@ mod tests {
         sectors: u64,
         never_ok: HashSet<u64>,
         fail_times: HashMap<u64, usize>,
+        slow_ms: HashMap<u64, u64>, // lectura correcta pero lenta
         attempts: RefCell<HashMap<u64, usize>>,
         reads_other: RefCell<u64>, // lecturas de sectores distintos de los marcados
     }
@@ -488,6 +706,7 @@ mod tests {
                 sectors,
                 never_ok: HashSet::new(),
                 fail_times: HashMap::new(),
+                slow_ms: HashMap::new(),
                 attempts: RefCell::new(HashMap::new()),
                 reads_other: RefCell::new(0),
             }
@@ -497,6 +716,9 @@ mod tests {
         }
         fn poison(&mut self, lba: u64) {
             self.never_ok.insert(lba);
+        }
+        fn slow(&mut self, lba: u64, ms: u64) {
+            self.slow_ms.insert(lba, ms);
         }
         fn byte_for(lba: u64) -> u8 {
             ((lba % 251) + 7) as u8
@@ -521,6 +743,9 @@ mod tests {
             }
             if !self.fail_times.contains_key(&lba) && !self.never_ok.contains(&lba) {
                 *self.reads_other.borrow_mut() += 1;
+            }
+            if let Some(ms) = self.slow_ms.get(&lba) {
+                thread::sleep(Duration::from_millis(*ms));
             }
             buf.fill(Self::byte_for(lba));
             Ok(())
@@ -549,7 +774,77 @@ mod tests {
             max_temp: None,
             device: None,
             backup: None,
+            rate_limit: None,
+            min_read_rate: MinRate::Off,
+            max_error_rate: None,
         }
+    }
+
+    #[test]
+    fn throttle_duerme_al_superar_el_techo_de_tasa() {
+        let mut th = Throttle {
+            limit: 1024,
+            win_start: None,
+            bytes: 0,
+        };
+        let t = Instant::now();
+        assert!(th.feed(t, 1024).is_none(), "justo en el límite no duerme");
+        let d = th.feed(t, 512).expect("superado el límite debe pedir sueño");
+        assert!(
+            d > Duration::ZERO && d <= Duration::from_millis(1000),
+            "sueño fuera de la ventana: {d:?}"
+        );
+    }
+
+    #[test]
+    fn zona_lenta_diferida_en_directa_se_recupera_en_las_fases_lentas() {
+        let dir = tmpdir("lenta");
+        let img_path = dir.join("d.raw");
+        let map_path = dir.join("d.map");
+        let sectors = 1024u64;
+        let mut src = MockRescue::new(sectors);
+        src.slow(100, 60); // sector 100 tarda 60 ms en leerse
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut map = MapFile::new(sectors);
+        let mut o = opts(sectors, 64, 3, true);
+        o.min_read_rate = MinRate::Bytes(3_200_000); // bloque de 64: presupuesto 10 ms
+        let rep = run_rescue(&mut src, &mut img, &mut map, &o, &map_path, |_| {}).unwrap();
+        assert!(
+            rep.slow_deferred >= 1,
+            "la fase directa debió diferir el bloque lento"
+        );
+        assert_eq!(rep.good, 1024, "lo lento se recupera en división");
+        assert_eq!(rep.failed + rep.untried, 0);
+        let bytes = fs::read(&img_path).unwrap();
+        let off = 100 * SECTOR_SIZE;
+        assert_eq!(bytes[off], MockRescue::byte_for(100), "el sector lento quedó copiado");
+        // Se releyó al menos una vez más que un sector normal (directa diferida + división).
+        assert!(*src.attempts.borrow().get(&100).unwrap() >= 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tasa_maxima_de_errores_aborta_con_el_mapa_guardado() {
+        let dir = tmpdir("errrate");
+        let img_path = dir.join("d.raw");
+        let map_path = dir.join("d.map");
+        let sectors = 1024u64;
+        let mut src = MockRescue::new(sectors);
+        for l in 64..192 {
+            src.poison(l);
+        }
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut map = MapFile::new(sectors);
+        let mut o = opts(sectors, 64, 3, true);
+        o.max_error_rate = Some(20_000); // el primer bloque fallido (32 KiB) ya lo cruza
+        let e = run_rescue(&mut src, &mut img, &mut map, &o, &map_path, |_| {})
+            .expect_err("debe abortar al cruzar la tasa");
+        assert!(e.to_string().contains("tasa máxima de errores"), "{e}");
+        let loaded = MapFile::load(&map_path).expect("el mapfile debe quedar guardado");
+        assert_eq!(loaded.stats().0, 64, "lo sano ya copiado queda Good");
+        assert_eq!(loaded.stats().1, 64, "el bloque fallido queda Failed");
+        assert_eq!(loaded.stats().3, 1024 - 128, "lo no visitado queda pendiente para --resume");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

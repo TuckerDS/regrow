@@ -89,6 +89,9 @@ pub struct CommonOpts {
     pub fill_from: Option<PathBuf>,  // (rescue) relleno: donante = segunda copia del origen
     pub donor_map: Option<PathBuf>,  // (rescue) mapfile del donante (propio o de texto)
     pub allow_zeros: bool,           // (rescue/fill) escribir también sectores todo-cero del donante
+    pub rate_limit: Option<u64>,     // (rescue) techo de bytes/s copiados a la imagen
+    pub min_read_rate: rescue::MinRate, // (rescue) umbral de zona lenta en la fase directa
+    pub max_error_rate: Option<u64>, // (rescue) aborto si los intentos fallidos superan esta tasa
     // Mapa de superficie (surfmap):
     pub sectors: Option<u64>, // dominio; si falta se toma del checkpoint
     pub cells: usize,         // resolución del mapa (def 1024)
@@ -138,6 +141,15 @@ fn usage() -> ! {
          \x20 --backup-file R    (rescue) sidecar donde respaldar cada sector antes de\n\
          \x20                    sobrescribirlo (def: <imagen>.respaldo)\n\
          \x20 --no-backup        (rescue) desactivar el respaldo — no recomendado\n\
+         \x20 --rate-limit B     (rescue) techo de bytes/s copiados a la imagen (sufijos\n\
+         \x20                    K/M; 'off'); al superarlo duerme hasta cerrar la ventana —\n\
+         \x20                    para convivir con una máquina en producción\n\
+         \x20 --min-read-rate N  (rescue) en la fase directa, un bloque que se lea más\n\
+         \x20                    despacio de N bytes/s (o 'auto' = décima parte del ritmo\n\
+         \x20                    medio) NO se copia en ese momento: queda pendiente y lo\n\
+         \x20                    retrabajan las fases lentas, que aceptan lecturas lentas\n\
+         \x20 --max-error-rate B (rescue) detener con el mapfile guardado si los intentos\n\
+         \x20                    fallidos superan B bytes/s sostenidos\n\
          \x20 --no-reverse       (rescue) desactivar la pasada inversa final\n\
          \x20 --map F            mapfile propio: en rescue el de la imagen\n\
           \x20                    destino (def: <imagen-destino>.map); en las pasadas\n\
@@ -193,6 +205,52 @@ fn take_path(args: &[String], i: &mut usize, name: &str) -> PathBuf {
         std::process::exit(2);
     }
     PathBuf::from(&args[*i])
+}
+
+/// Tasa en bytes/s con sufijos: `500K`, `2M`, `1048576`; `off`/`0` desactiva.
+fn parse_rate_str(name: &str, v: &str) -> Option<u64> {
+    let v = v.trim().to_lowercase();
+    if v == "off" || v == "0" {
+        return None;
+    }
+    let (num, mul) = match v.chars().last() {
+        Some('k') => (&v[..v.len() - 1], 1024u64),
+        Some('m') => (&v[..v.len() - 1], 1024 * 1024),
+        _ => (&v[..], 1u64),
+    };
+    match num.parse::<u64>() {
+        Ok(x) if x > 0 => Some(x.saturating_mul(mul)),
+        _ => {
+            eprintln!("error: valor inválido para {name}: {v} (bytes/s, sufijos K o M, u 'off')");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn take_rate(args: &[String], i: &mut usize, name: &str) -> Option<u64> {
+    *i += 1;
+    if *i >= args.len() {
+        eprintln!("error: {name} necesita valor");
+        std::process::exit(2);
+    }
+    parse_rate_str(name, &args[*i])
+}
+
+/// `--min-read-rate auto|N[|K|M]|off`: política de zona lenta de la fase directa.
+fn take_min_rate(args: &[String], i: &mut usize) -> rescue::MinRate {
+    *i += 1;
+    if *i >= args.len() {
+        eprintln!("error: --min-read-rate necesita valor ('auto', bytes/s con sufijos K/M, u 'off')");
+        std::process::exit(2);
+    }
+    let v = args[*i].trim().to_lowercase();
+    if v == "auto" {
+        return rescue::MinRate::Auto;
+    }
+    match parse_rate_str("--min-read-rate", &v) {
+        None => rescue::MinRate::Off,
+        Some(r) => rescue::MinRate::Bytes(r),
+    }
 }
 
 /// `--latency a,b,c,d`: umbrales de las bandas T1..T4 en ms, estrictamente
@@ -262,6 +320,9 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         fill_from: None,
         donor_map: None,
         allow_zeros: false,
+        rate_limit: None,
+        min_read_rate: rescue::MinRate::Off,
+        max_error_rate: None,
         sectors: None,
         cells: surfmap::SURFMAP_DEFAULT_CELLS,
         out_path: None,
@@ -298,6 +359,9 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
             "--block" => o.block = take_num(args, &mut i, "--block").clamp(1, 65536) as usize,
             "--retry" => o.retries = take_num(args, &mut i, "--retry").clamp(1, 255) as u8,
             "--retry-wait" => o.retry_wait = take_num(args, &mut i, "--retry-wait").clamp(0, 3600),
+            "--rate-limit" => o.rate_limit = take_rate(args, &mut i, "--rate-limit"),
+            "--min-read-rate" => o.min_read_rate = take_min_rate(args, &mut i),
+            "--max-error-rate" => o.max_error_rate = take_rate(args, &mut i, "--max-error-rate"),
             "--no-reverse" => o.reverse = false,
             "--map" => o.map_path = Some(take_path(args, &mut i, "--map")),
             "--backup-file" => o.backup_file = Some(take_path(args, &mut i, "--backup-file")),
@@ -633,6 +697,9 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
                 PathBuf::from(s)
             }))
         },
+        rate_limit: o.rate_limit,
+        min_read_rate: o.min_read_rate,
+        max_error_rate: o.max_error_rate,
     };
     match &ropts.backup {
         Some(p) => println!(
@@ -647,13 +714,15 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         if last_line.elapsed().as_secs() >= 30 {
             last_line = Instant::now();
             println!(
-                "── [{}] sector {} · buenos {} pendientes {} · bloques {}/{} ok-err · {}",
+                "── [{}] sector {} · buenos {} pendientes {} · bloques {}/{} ok-err · {:.0} KiB/s{} · {}",
                 p.phase.label(),
                 p.cur,
                 p.good,
                 p.pending,
                 p.blocks_ok,
                 p.block_errors,
+                p.copied_bytes as f64 / (t0.elapsed().as_secs().max(1) as f64) / 1024.0,
+                if p.slow_deferred > 0 { format!(" · lentos {}", p.slow_deferred) } else { String::new() },
                 format_hms(t0.elapsed().as_secs())
             );
         }
@@ -681,6 +750,12 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         "  buenos: {}  fallidos (se reintentan con --resume): {}  rascados: {}  sin mapear: {}",
         rep.good, rep.failed, rep.scraped, rep.untried
     );
+    if rep.slow_deferred > 0 {
+        println!(
+            "  bloques lentos diferidos por --min-read-rate en la fase directa: {}",
+            rep.slow_deferred
+        );
+    }
     if rep.failed + rep.scraped + rep.untried > 0 {
         println!(
             "  quedan pendientes: repite con --resume (origen y destino idénticos; mapa {})",
@@ -2279,6 +2354,9 @@ mod tests {
             fill_from: None,
             donor_map: None,
             allow_zeros: false,
+            rate_limit: None,
+            min_read_rate: rescue::MinRate::Off,
+            max_error_rate: None,
             sectors: None,
             cells: surfmap::SURFMAP_DEFAULT_CELLS,
             out_path: None,
@@ -2362,6 +2440,28 @@ mod tests {
         assert!(v.contains("TuckerDS"), "{v}");
         assert!(v.contains(env!("CARGO_PKG_VERSION")), "{v}");
         assert!(v.contains("GPL-3.0-or-later"), "{v}");
+    }
+
+    /// Techos de rescate: sufijos K/M, 'off' desactiva, 'auto' en el umbral
+    /// de zona lenta.
+    #[test]
+    fn parse_controles_de_tasa_rescue() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let o = parse_common(&s(&["x.raw", "--raw", "1"]));
+        assert_eq!(o.rate_limit, None);
+        assert_eq!(o.max_error_rate, None);
+        assert_eq!(o.min_read_rate, rescue::MinRate::Off);
+        let o = parse_common(&s(&[
+            "x.raw", "--raw", "1", "--rate-limit", "500K", "--max-error-rate", "2M",
+            "--min-read-rate", "auto",
+        ]));
+        assert_eq!(o.rate_limit, Some(500 * 1024));
+        assert_eq!(o.max_error_rate, Some(2 * 1024 * 1024));
+        assert_eq!(o.min_read_rate, rescue::MinRate::Auto);
+        let o = parse_common(&s(&["x.raw", "--raw", "1", "--min-read-rate", "64K"]));
+        assert_eq!(o.min_read_rate, rescue::MinRate::Bytes(65536));
+        let o = parse_common(&s(&["x.raw", "--raw", "1", "--rate-limit", "off"]));
+        assert_eq!(o.rate_limit, None);
     }
 
     /// --latency parsea cuatro umbrales crecientes; 'off'
