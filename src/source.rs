@@ -299,9 +299,15 @@ pub(crate) fn disk_key(name: &str) -> String {
     };
     loop {
         // Sufijo de partición con marcador: …sN / …pN (macOS, NVMe, mmc).
+        // El marcador solo cuenta si va ENRENCADO de un dígito: en `loop1`
+        // la «p» es parte del nombre del nodo, no un separador de partición
+        // (recortarla hacía «loo» y confundía loop1 con loop2).
         if let Some(pos) = k.rfind(['s', 'p']) {
             let suffix = &k[pos + 1..];
-            if !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()) {
+            if !suffix.is_empty()
+                && suffix.bytes().all(|c| c.is_ascii_digit())
+                && k[..pos].ends_with(|c: char| c.is_ascii_digit())
+            {
                 k.truncate(pos);
                 continue;
             }
@@ -1582,6 +1588,12 @@ mod tests {
         assert_eq!(disk_key("/dev/nvme0n1"), "nvme0n1");
         assert_eq!(disk_key("/dev/nvme0n1p2"), "nvme0n1");
         assert_eq!(disk_key("/dev/mmcblk0p1"), "mmcblk0");
+        // «loop» no es marcador de partición pese a su «p»: loop1 y loop2
+        // son discos distintos (fallo de campo detectado en la validación).
+        assert_eq!(disk_key("/dev/loop1"), "loop1");
+        assert_eq!(disk_key("/dev/loop2"), "loop2");
+        assert_ne!(disk_key("/dev/loop1"), disk_key("/dev/loop2"));
+        assert_eq!(disk_key("/dev/loop0p1"), "loop0");
     }
 
     /// La sonda de nodo distinguible disco-entero vs partición: las órdenes
