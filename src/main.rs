@@ -1166,6 +1166,12 @@ fn cli_prescan(o: &CommonOpts) -> ExitCode {
         Ok(v) => v,
         Err(c) => return c,
     };
+    // Sondeo con el primer sector (comando no-data inocuo) para que la
+    // cabecera refleje la realidad: hay nodos que responden a la consulta
+    // de versión pero rechazan la orden real — el sondeo los apaga aquí.
+    if o.verify && src.supports_direct_verify() {
+        let _ = src.verify_chunk(start as u64, 1, Duration::from_secs(o.timeout_secs));
+    }
     println!(
         "{label}: {} sectores (medio: {}), barrido bulk [{start}..{end}) — prescan{}",
         src.sector_count(),
@@ -1266,6 +1272,10 @@ fn cli_speedtest(o: &CommonOpts) -> ExitCode {
         Ok(v) => v,
         Err(c) => return c,
     };
+    // Sondeo de realidad antes de la cabecera (ver nota en cli_prescan).
+    if o.verify && src.supports_direct_verify() {
+        let _ = src.verify_chunk(start as u64, 1, Duration::from_secs(o.timeout_secs));
+    }
     println!(
         "{label}: {} sectores (medio: {}), lectura bulk [{start}..{end}) — speedtest ({} KiB/bloque){}",
         src.sector_count(),
@@ -1917,6 +1927,11 @@ pub(crate) fn process_run(
     };
     let phys = src.phys_block();
 
+    // Sondeo de realidad antes de la cabecera (ver nota en cli_prescan): el
+    // prescan interno usará la verificación directa solo si el nodo la admite.
+    if o.verify && opts.prescan && src.supports_direct_verify() {
+        let _ = src.verify_chunk(start as u64, 1, opts.op_timeout);
+    }
     say(format!(
         "{display}: {} sectores (medio: {}), rango [{start}..{end}) — modo {}{}",
         src.sector_count(),
