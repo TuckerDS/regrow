@@ -96,6 +96,7 @@ pub fn cdb_read_native_max48() -> [u8; 16] {
     c[0] = SAT16_OPCODE;
     c[1] = (3 << 1) | 1; // protocol no-data + EXTEND
     c[2] = (1 << 5) | (1 << 3) | (1 << 2); // ck_cond | t_dir | byte_block
+    c[13] = 0x40; // device: modo LBA — sin él la unidad aborta el comando
     c[14] = ATA_READ_NATIVE_MAX48;
     c
 }
@@ -282,27 +283,36 @@ fn sg_exec(
     let n = (hdr.sb_len_wr as usize).min(sense.len());
     let s = &sense[..n];
     let ard = parse_ard(s);
-    let (sense_key, asc) = if n >= 8 && matches!(s[0] & 0x7f, 0x70 | 0x71) {
+    let (sense_key, asc) = if n >= 8 && matches!(s[0] & 0x7f, 0x70 | 0xf0) {
         (s[2] & 0x0f, s.get(12).copied())
     } else if n >= 3 && matches!(s[0] & 0x7f, 0x72 | 0x73) {
         (s[1] & 0x0f, s.get(2).copied())
     } else {
         (0xff, None)
     };
-    if hdr.host_status == 0 && hdr.driver_status == 0 {
-        if hdr.status == 0 {
-            // GOOD: éxito simple (la ARD puede acompañar sin sense key).
-            if expects_data && hdr.resid != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "la transferencia PIO-in quedó incompleta",
-                ));
-            }
-            return Ok(SgOutcome { out_ard: ard });
+    // Registros ATA en sense FIXED (respuesta 0x70/0xf0 de SAT-2+): error en
+    // [3], status en [4] — los usa el mensaje de error; en 0xf0 acompañan
+    // siempre (es el formato «ATA pass through information available»).
+    let (fix_err, fix_status) = if n >= 8 && matches!(s[0] & 0x7f, 0x70 | 0xf0) {
+        (Some(s[3]), Some(s[4]))
+    } else {
+        (None, None)
+    };
+    if hdr.host_status == 0 && hdr.driver_status == 0 && hdr.status == 0 {
+        // GOOD: éxito simple (la ARD puede acompañar sin sense key).
+        if expects_data && hdr.resid != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "la transferencia PIO-in quedó incompleta",
+            ));
         }
-        // CHECK CONDITION con ARD cuyo status ATA dice DRDY, !BSY, !ERR:
-        // el comando ATA terminó bien; el sense solo trae los registros
-        // pedidos (ck_cond). Es el éxito normal de READ NATIVE MAX.
+        return Ok(SgOutcome { out_ard: ard });
+    }
+    // CHECK CONDITION con ARD cuyo status ATA dice DRDY, !BSY, !ERR: el
+    // comando ATA terminó bien; el sense solo trae los registros pedidos
+    // (ck_cond). driver_status 0x08 (DRIVER_SENSE) es normal aquí: el medio
+    // respondió — lo que manda es el host byte limpio y el status ATA.
+    if hdr.host_status == 0 {
         if let Some(a) = &ard {
             if (a.status & 0xc1) == 0x40 {
                 return Ok(SgOutcome { out_ard: ard });
@@ -341,8 +351,10 @@ fn sg_exec(
             hdr.driver_status,
             sense_key,
             ard.map(|a| format!(" ata_error=0x{:02x}", a.error))
+                .or_else(|| fix_err.map(|e| format!(" ata_error=0x{e:02x}")))
                 .unwrap_or_default(),
             ard.map(|a| format!(" ata_status=0x{:02x}", a.status))
+                .or_else(|| fix_status.map(|e| format!(" ata_status=0x{e:02x}")))
                 .unwrap_or_default(),
         ),
     ))
@@ -611,6 +623,7 @@ mod tests {
         assert_eq!(c[0], 0x85);
         assert_eq!(c[1], (3 << 1) | 1, "no-data + EXTEND");
         assert_eq!(c[2], (1 << 5) | (1 << 3) | (1 << 2), "ck_cond | t_dir | byte_block");
+        assert_eq!(c[13], 0x40, "device en modo LBA: sin ese bit la unidad aborta");
         assert_eq!(c[14], 0x27, "READ NATIVE MAX ADDRESS(48)");
     }
 
