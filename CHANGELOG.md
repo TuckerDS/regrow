@@ -68,6 +68,18 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   (smartctl o hdparm en Linux; en macOS/Windows queda documentado, no
   ejecutado). Doble confirmación obligatoria (--allow-data-loss + teclear
   SANEAR, o --yes en uso no interactivo) y jamás sobre un disco montado.
+- Verbo nuevo `clone --from PATH --raw N | --dev PATH`: clona sector a sector
+  un origen (imagen .raw o nodo crudo) a un DESTINO crudo con las mismas fases
+  y el mapfile reanudable del rescate — la forma ddrescue de devolver los
+  datos a un disco de reemplazo o copiar disco a disco. Puertas: jamás sobre
+  el mismo disco (o una partición del origen), jamás sobre un disco montado,
+  tamaño del destino suficiente para el rango, y confirmación destructiva
+  doble (--allow-data-loss + --no-backup + teclear CLONAR, o --yes). El
+  destino no recibe sidecar (documentado): para conservar lo que había,
+  rescátalo antes a una imagen. `--verify` en clone relee y contrasta cada
+  bloque recién escrito; un destino que miente aborta con el mapa guardado.
+  `--resume`, `--requeue`, `--rate-limit`, `--min-read-rate`, techo de
+  temperatura y el registro de tasas del rescate aplican igual.
 
 ## [0.2.0] - 2026-11-21
 

@@ -50,7 +50,7 @@ use engine::{
 };
 use log::{format_asctime, format_hms, merge_logs, rotate_log_chain, write_log, DiskLog, Flag, Record};
 use smart::{print_status, query as smart_query, TemperatureGuard};
-use source::{mounted_overlap, FileImage, MediaKind, RawDisk, SectorSource};
+use source::{disk_key, mounted_overlap, FileImage, MediaKind, RawDisk, SectorSource};
 use speed::{run_speedtest, SPEED_CHUNK};
 use state::{load_pending, resume_note, resume_plan, state_path, Checkpoint};
 
@@ -96,6 +96,8 @@ pub struct CommonOpts {
     pub requeue: bool,               // (rescue) los tramos agotados vuelven a pendientes
     pub preview: Option<usize>,      // (rescue) avance hex+ASCII en el estado (líneas)
     pub log_rates: Option<PathBuf>,  // (rescue) registro de ritmo apto para gráficas
+    // Clonado (clone): el origen explícito; el destino es --raw/--dev.
+    pub from: Option<PathBuf>,
     // Verificación directa del firmware (prescan/speedtest):
     pub verify: bool,                // --verify: comprobar sin transferir datos
     pub timeout_secs: u64,           // --timeout N: plazo por comando directo (s)
@@ -120,6 +122,14 @@ fn usage() -> ! {
          \x20                    --allow-data-loss y segunda confirmación: escribir SANEAR\n\
          \x20                    cuando se pida, o --yes en uso no interactivo. Jamás sobre\n\
          \x20                    un disco montado. En macOS/Windows documenta la delegación.\n\
+         \x20 regrow clone --from PATH --raw N | --dev PATH [opciones]\n\
+         \x20                    clonar sector a sector (forma ddrescue): el origen (--from, imagen\n\
+         \x20                    .raw o nodo crudo) se copia al DESTINO crudo con las fases y el\n\
+         \x20                    mapfile reanudable del rescate. irreversible sobre el destino:\n\
+         \x20                    exige --allow-data-loss + --no-backup (sin sidecar en un disco)\n\
+         \x20                    + segunda confirmación (escribir CLONAR, o --yes). Nunca sobre el\n\
+         \x20                    mismo disco ni sobre uno montado. --verify aquí relee y\n\
+         \x20                    contrastea lo escrito; --resume reanuda por el mapa.\n\
          \x20 regrow rescue <imagen-destino> --raw N | --dev PATH [opciones]\n\
          \x20 regrow surfmap --id N [--log-dir D] [--sectors N] [--cells N] [--out F]\n\
          \x20 regrow menu [imagen|--raw N|--dev PATH] [opciones]\n\
@@ -190,6 +200,7 @@ fn usage() -> ! {
           \x20                    pendientes (lo bueno no se lee ni se escribe) y anota lo\n\
           \x20                    reparado en --map; los tramos quedan en DISKn.ranges y\n\
           \x20                    --resume los retoma sin volver a dar el mapfile\n\
+         \x20 --from PATH        (clone) origen del clonado: imagen .raw o nodo de dispositivo\n\
          \x20 --fill-from F      (rescue) modo relleno: completar los huecos pendientes de la\n\
          \x20                    imagen desde una SEGUNDA COPIA del origen (donante, archivo).\n\
          \x20                    No necesita --raw/--dev; los `+` de la imagen jamás se tocan;\n\
@@ -368,6 +379,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
         requeue: false,
         preview: None,
         log_rates: None,
+        from: None,
         verify: false,
         timeout_secs: 30,
         yes: false,
@@ -423,6 +435,7 @@ pub(crate) fn parse_common(args: &[String]) -> CommonOpts {
                 o.preview = Some(n.clamp(1, 32) as usize);
             }
             "--log-rates" => o.log_rates = Some(take_path(args, &mut i, "--log-rates")),
+            "--from" => o.from = Some(take_path(args, &mut i, "--from")),
             "--verify" => o.verify = true,
             "--timeout" => o.timeout_secs = take_num(args, &mut i, "--timeout").clamp(1, 3600),
             "--yes" => o.yes = true,
@@ -560,6 +573,7 @@ pub fn main() -> ExitCode {
         "selftest" => cli_selftest(&args[1..]),
         "sanitize" => cli_sanitize(&args[1..]),
         "rescue" => cli_rescue(&parse_common(&args[1..])),
+        "clone" => cli_clone(&parse_common(&args[1..])),
         "surfmap" => cli_surfmap(&parse_common(&args[1..])),
         "prescan" => cli_prescan(&parse_common(&args[1..])),
         "speedtest" => cli_speedtest(&parse_common(&args[1..])),
@@ -1001,6 +1015,7 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
         min_read_rate: o.min_read_rate,
         max_error_rate: o.max_error_rate,
         preview_lines: o.preview.unwrap_or(0),
+        verify_dest: false, // rescue escribe en una imagen de archivo
     };
     match &ropts.backup {
         Some(p) => println!(
@@ -1093,6 +1108,340 @@ fn cli_rescue(o: &CommonOpts) -> ExitCode {
     if rep.failed + rep.scraped + rep.untried > 0 {
         println!(
             "  quedan pendientes: repite con --resume (origen y destino idénticos; mapa {})",
+            map_path.display()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Abre el origen de `clone`: un nodo de bloque se abre como disco crudo de
+/// lectura; un archivo normal, como imagen. En Windows solo el prefijo
+/// `\\.\` designa un dispositivo.
+fn open_clone_source(path: &Path) -> Result<(Box<dyn SectorSource>, Option<PathBuf>), String> {
+    #[cfg(windows)]
+    let is_device = path.display().to_string().starts_with("\\\\.\\");
+    #[cfg(not(windows))]
+    let is_device = {
+        use std::os::unix::fs::FileTypeExt;
+        matches!(fs::metadata(path), Ok(m) if m.file_type().is_block_device())
+    };
+    if is_device {
+        return match RawDisk::open(path, false) {
+            Ok(s) => Ok((Box::new(s), Some(path.to_path_buf()))),
+            Err(e) => Err(format!(
+                "error abriendo {}: {e}{}",
+                path.display(),
+                perm_note(&e)
+            )),
+        };
+    }
+    match FileImage::open_ro(path) {
+        Ok(s) => Ok((Box::new(s), None)),
+        Err(e) => Err(format!("error abriendo {}: {e}", path.display())),
+    }
+}
+
+/// ¿Origen y destino puntean al mismo disco físico? Mismo nodo tras enlaces,
+/// o una partición del disco origen: en ambos casos «clonar» sería una
+/// autocopia destructiva. Solo se compara entre dispositivos (una imagen
+/// jamás es «el mismo disco» que un nodo).
+fn same_device(a: &Path, b: &Path) -> bool {
+    let key = |p: &Path| disk_key(&p.to_string_lossy());
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb || key(&ca) == key(&cb),
+        _ => key(a) == key(b),
+    }
+}
+
+/// `clone`: copia sector a sector un ORIGEN (imagen o disco crudo) a un
+/// DESTINO crudo con las mismas fases y el mapfile reanudable del rescate —
+/// la forma ddrescue de «devolver los datos a un disco» (p. ej. volcar la
+/// imagen rescatada sobre un disco de reemplazo, o disco a disco).
+/// El destino NO recibe sidecar: respaldar lo que había en el destino es
+/// trabajo de `rescue`. Doble confirmación destructiva obligatoria.
+fn cli_clone(o: &CommonOpts) -> ExitCode {
+    let Some(from) = o.from.clone() else {
+        eprintln!("error: clone necesita el origen: --from PATH (imagen .raw o nodo de dispositivo)");
+        return ExitCode::from(2);
+    };
+    if o.raw.is_none() && o.dev.is_none() {
+        eprintln!("error: clone necesita el destino crudo (--raw N | --dev PATH). Para clonar a un ARCHIVO usa rescue.");
+        return ExitCode::from(2);
+    }
+    if o.image.is_some() {
+        eprintln!("error: en clone la ruta posicional no es el destino; el destino se da con --raw/--dev (¿querías rescue?).");
+        return ExitCode::from(2);
+    }
+    if o.backup_file.is_some() || !o.no_backup {
+        eprintln!(
+            "error: clone no respalda el contenido previo del destino (no hay sidecar en un disco): para eso existe rescue.\n\
+             \x20 Si quieres el respaldo, rescata primero el destino a una imagen; si lo aceptas vacío, añade --no-backup."
+        );
+        return ExitCode::from(2);
+    }
+    let (mut src, src_dev) = match open_clone_source(&from) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let total = src.sector_count();
+    let total32 = total.min(u32::MAX as u64) as u32;
+    let end = o.end.unwrap_or(total32).min(total32);
+    if o.start >= end {
+        eprintln!("error: rango vacío (start={} end={end}, origen={total})", o.start);
+        return ExitCode::from(1);
+    }
+
+    // Puerta de identidad ANTES de abrir nada en escritura.
+    let dst_name = o
+        .dev
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(RawDisk::native_name(o.raw.unwrap_or_default())));
+    if same_device(&from, &dst_name) {
+        eprintln!(
+            "Bloqueado: el origen ({}) y el destino ({}) son el mismo disco físico (o el destino es una partición del origen). Clonar así destruiría los datos que aún no se copiaron.",
+            from.display(),
+            dst_name.display()
+        );
+        return ExitCode::from(2);
+    }
+    if disk_key(&dst_name.to_string_lossy()).starts_with("loop") {
+        eprintln!(
+            "aviso: el destino es un dispositivo de bucle; clone no puede saber si está respaldado por un archivo. Asegúrate de que su archivo backing no es el propio origen."
+        );
+    }
+
+    // Destino: disco crudo en escritura (la capa aplica la puerta de montaje,
+    // O_EXCL y la lectura de solo-lectura si el nodo está protegido).
+    let (dst_label, dst_dev, mut dst) = match open_target(&o, true) {
+        Ok(v) => v,
+        Err((msg, code)) => {
+            eprintln!("{msg}");
+            return code;
+        }
+    };
+    // Puerta de tamaño: los offsets del clonado son los LBAs del origen; el
+    // destino debe cubrir el rango (un destino más pequeño que el origen solo
+    // vale recortando con --end).
+    if dst.sector_count() < end as u64 {
+        eprintln!(
+            "error: el destino {} tiene {} sectores y el rango llega a {end}; usa --end {} o menos, o un destino mayor.",
+            dst_label,
+            dst.sector_count(),
+            dst.sector_count()
+        );
+        return ExitCode::from(2);
+    }
+
+    // Confirmación destructiva doble (misma filosofía que sanitize).
+    if !o.allow_data_loss {
+        eprintln!(
+            "Bloqueado: clone sobrescribe TODO el contenido del destino {} hasta el sector {end}. Si de verdad quieres hacerlo, añade --allow-data-loss y prepara la segunda confirmación."
+        ,
+            dst_label
+        );
+        return ExitCode::from(3);
+    }
+    if o.yes {
+        eprintln!(
+            "clone sobre {dst_label}: irreversible. --yes + --allow-data-loss aceptados.",
+        );
+    } else {
+        println!(
+            "Vas a clonar {} → {dst_label} (rango [{}..{end})): irreversible, sobrescribe el destino. Escribe CLONAR y pulsa intro (cualquier otra cosa aborta):",
+            from.display(),
+            o.start
+        );
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                eprintln!("sin terminal no se puede pedir la confirmación tecleada: usa --yes junto con --allow-data-loss.");
+                return ExitCode::from(3);
+            }
+            Ok(_) if line.trim() == "CLONAR" => {}
+            Ok(_) => {
+                eprintln!("confirmación no recibida: nada se clonó, abortado.");
+                return ExitCode::from(3);
+            }
+        }
+    }
+
+    // Mapfile: dominio = sectores del origen; reanudación igual que rescue.
+    let map_path = o.map_path.clone().unwrap_or_else(|| {
+        let name = from
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "origen".to_string());
+        PathBuf::from(format!("{name}.clone.map"))
+    });
+    let mut map = if let Some(imp) = &o.import_map {
+        match mapfile::MapFile::import_text(imp, total) {
+            Ok(m) => {
+                let (g, _, _, _) = m.stats();
+                println!("mapa ajeno importado desde {}: {} sectores ya buenos NO se releerán", imp.display(), g);
+                m
+            }
+            Err(e) => {
+                eprintln!("error importando el mapfile: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if map_path.exists() {
+        if o.resume {
+            match mapfile::MapFile::load(&map_path) {
+                Ok(m) => {
+                    if m.sector_count != total {
+                        eprintln!(
+                            "error: el mapfile es de un dominio de {} sectores y el origen tiene {total}",
+                            m.sector_count
+                        );
+                        return ExitCode::from(1);
+                    }
+                    let (g, _, _, _) = m.stats();
+                    println!("reanudando desde {}: {} sectores ya clonados preservados", map_path.display(), g);
+                    m
+                }
+                Err(e) => {
+                    eprintln!("error leyendo el mapfile: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            eprintln!(
+                "aviso: existe un mapfile en {}; IGNORADO (añade --resume para continuarlo). Al terminar será sobrescrito.",
+                map_path.display()
+            );
+            mapfile::MapFile::new(total)
+        }
+    } else {
+        mapfile::MapFile::new(total)
+    };
+    if o.requeue {
+        let n = map.requeue_scraped();
+        println!(
+            "requeue: {} sectores que el mapa daba por agotados vuelven a pendientes",
+            n
+        );
+    }
+
+    println!(
+        "{} → {dst_label}: clonado [{}..{end}) sobre {} sectores de origen (destino: {} sectores, medio: {}){}",
+        from.display(),
+        o.start,
+        total,
+        dst.sector_count(),
+        src.media().label(),
+        if dst.sector_count() < total {
+            format!(" — el destino es más pequeño: {} sectores del final del origen quedan fuera", total - dst.sector_count())
+        } else {
+            String::new()
+        }
+    );
+    if o.verify {
+        println!("--verify en clone: cada bloque se relee del destino y se compara con lo escrito (contraste); un destino que miente aborta con el mapa guardado");
+    }
+    for line in ata_forensics_lines(&*dst, true) {
+        println!("{line}");
+    }
+    println!("sin respaldo del destino (documentado): lo que había en {dst_label} se pierde; para conservarlo, rescátalo antes a una imagen");
+
+    let ropts = rescue::RescueOptions {
+        start: o.start as u64,
+        end: end as u64,
+        block: o.block.max(1),
+        retries: o.retries.max(1),
+        reverse: o.reverse,
+        save_every_ops: rescue::RESCUE_SAVE_EVERY_OPS,
+        retry_wait: Duration::from_secs(o.retry_wait),
+        max_temp: o.max_temp,
+        device: src_dev.or_else(|| dst_dev.clone()),
+        backup: None,
+        rate_limit: o.rate_limit,
+        min_read_rate: o.min_read_rate,
+        max_error_rate: o.max_error_rate,
+        preview_lines: o.preview.unwrap_or(0),
+        verify_dest: o.verify,
+    };
+    let mut rates_log: Option<fs::File> = o.log_rates.as_ref().and_then(|p| {
+        match fs::OpenOptions::new().create(true).append(true).open(p) {
+            Ok(mut f) => {
+                if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+                    let _ = writeln!(f, "# segundos sector buenos pendientes bloques_ok bloques_err KiBps");
+                }
+                Some(f)
+            }
+            Err(e) => {
+                eprintln!("aviso: no podré escribir el registro de tasas {}: {e}", p.display());
+                None
+            }
+        }
+    });
+    let t0 = Instant::now();
+    let mut last_line = Instant::now();
+    let rep = match rescue::run_rescue(&mut *src, &mut *dst, &mut map, &ropts, &map_path, |p: &rescue::Progress| {
+        if last_line.elapsed().as_secs() >= 30 {
+            last_line = Instant::now();
+            let rate_kibs =
+                p.copied_bytes as f64 / (t0.elapsed().as_secs().max(1) as f64) / 1024.0;
+            println!(
+                "── [{}] sector {} · buenos {} pendientes {} · bloques {}/{} ok-err · {:.0} KiB/s{} · {}",
+                p.phase.label(),
+                p.cur,
+                p.good,
+                p.pending,
+                p.blocks_ok,
+                p.block_errors,
+                rate_kibs,
+                if p.slow_deferred > 0 { format!(" · lentos {}", p.slow_deferred) } else { String::new() },
+                format_hms(t0.elapsed().as_secs())
+            );
+            if let Some(f) = &mut rates_log {
+                let _ = writeln!(
+                    f,
+                    "{} {} {} {} {} {} {:.1}",
+                    t0.elapsed().as_secs(),
+                    p.cur,
+                    p.good,
+                    p.pending,
+                    p.blocks_ok,
+                    p.block_errors,
+                    rate_kibs
+                );
+                let _ = f.flush();
+            }
+        }
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error durante el clonado: {e}");
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                eprintln!(
+                    "  el mapa quedó guardado en {}; repite con --resume para continuar (mismos origen y destino)",
+                    map_path.display()
+                );
+            }
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(x) = &o.export_map {
+        match map.export_text(x) {
+            Ok(()) => println!("mapa de texto exportado a {}", x.display()),
+            Err(e) => eprintln!("aviso: no se pudo exportar el mapa de texto: {e}"),
+        }
+    }
+    println!("clonado terminado en {}", format_hms(rep.seconds));
+    println!(
+        "  clonados: {}  ilegibles en el origen (quedan sin copiar): {}  rascados: {}  sin reintentar aún: {}",
+        rep.good, rep.failed, rep.scraped, rep.untried
+    );
+    if rep.failed + rep.scraped + rep.untried > 0 {
+        println!(
+            "  quedan pendientes: repite con --resume (mapa {}). Un origen con ilegibles NO puede clonarse byte a byte: compara el resultado solo en los sectores buenos del mapa.",
             map_path.display()
         );
     }
@@ -2663,6 +3012,7 @@ mod tests {
             requeue: false,
             preview: None,
             log_rates: None,
+            from: None,
             verify: false,
             timeout_secs: 30,
             yes: false,
@@ -2857,6 +3207,170 @@ mod tests {
             ExitCode::from(3),
             "sin --allow-data-loss no se llega ni a pedir confirmación"
         );
+    }
+
+    /// `--from` alimenta el origen del clonado.
+    #[test]
+    fn parse_from_origen_de_clone() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let o = parse_common(&s(&["clone", "--from", "src.raw", "--dev", "/dev/loop0"]));
+        assert_eq!(o.from.as_deref(), Some(Path::new("src.raw")));
+        let o = parse_common(&s(&["clone"]));
+        assert!(o.from.is_none());
+    }
+
+    /// Gates de `clone` que abortan antes de tocar nada: sin origen, sin
+    /// destino crudo, ruta posicional (eso es rescue), sin aceptar la ausencia
+    /// de sidecar, y autocopia sobre el mismo disco.
+    #[test]
+    fn clone_gates_previos() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        // Sin --from.
+        assert_eq!(
+            cli_clone(&parse_common(&s(&["--dev", "/dev/regrow-no-existe-zz"]))),
+            ExitCode::from(2)
+        );
+        // Sin destino crudo.
+        assert_eq!(cli_clone(&parse_common(&s(&["--from", "src.raw"]))), ExitCode::from(2));
+        // Ruta posicional: en clone no es el destino (eso es rescue).
+        assert_eq!(
+            cli_clone(&parse_common(&s(&["dest.raw", "--from", "src.raw", "--dev", "/dev/x"]))),
+            ExitCode::from(2)
+        );
+        // Sin aceptar explícitamente la ausencia de sidecar.
+        assert_eq!(
+            cli_clone(&parse_common(&s(&["--from", "src.raw", "--dev", "/dev/x"]))),
+            ExitCode::from(2),
+            "falta --no-backup: clone no respalda el destino"
+        );
+        // Autocopia: origen y destino son literalmente el mismo nodo (se usa
+        // un archivo real para que el origen abra y la puerta actúe).
+        let tmp = std::env::temp_dir().join(format!("regrow_same_{}", std::process::id()));
+        fs::write(&tmp, vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            cli_clone(&parse_common(&s(&[
+                "--from",
+                &tmp.display().to_string(),
+                "--dev",
+                &tmp.display().to_string(),
+                "--allow-data-loss",
+                "--no-backup",
+                "--yes",
+            ]))),
+            ExitCode::from(2),
+            "mismo nodo: bloqueado antes de abrir el destino"
+        );
+        let _ = fs::remove_file(&tmp);
+        // Partición del disco origen: la clave de disco unifica ambos nodos.
+        assert!(same_device(Path::new("/dev/sdb"), Path::new("/dev/sdb5")));
+        assert!(same_device(Path::new("/dev/nvme0n1"), Path::new("/dev/nvme0n1p2")));
+        assert!(!same_device(Path::new("/dev/sda"), Path::new("/dev/sdb")));
+    }
+
+    /// Flujo completo de `clone` sobre archivos: en macOS RawDisk abre un
+    /// archivo sin banderas especiales y el destino crudo puede ser un archivo
+    /// normal. En Linux esta ruta se valida en campo contra dispositivos de
+    /// bucle reales (las banderas O_DIRECT/O_SYNC/O_EXCL no son para archivos).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clone_completo_sobre_archivos_y_reanudacion() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let dir = std::env::temp_dir().join(format!("regrow_clone_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("origen.raw");
+        let dst = dir.join("destino.raw");
+        let map = dir.join("clon.map");
+        let sectors = 1000u64;
+        // Origen con patrón reconocible; destino preexistente con basura.
+        let data: Vec<u8> = (0..(sectors as usize * 512)).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &data).unwrap();
+        fs::write(&dst, vec![0x5Au8; sectors as usize * 512]).unwrap();
+
+        let code = cli_clone(&parse_common(&s(&[
+            "--from",
+            &src.display().to_string(),
+            "--dev",
+            &dst.display().to_string(),
+            "--map",
+            &map.display().to_string(),
+            "--block",
+            "64",
+            "--allow-data-loss",
+            "--no-backup",
+            "--yes",
+        ])));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(fs::read(&dst).unwrap(), data, "el destino quedó byte a byte igual al origen");
+        assert!(map.exists(), "el mapfile del clonado se escribe");
+
+        // Reanudación: todo bueno ⇒ segunda corrida no relee ni reescribe nada
+        // (el mapa lo impide) y el destino sigue idéntico.
+        let code = cli_clone(&parse_common(&s(&[
+            "--from",
+            &src.display().to_string(),
+            "--dev",
+            &dst.display().to_string(),
+            "--map",
+            &map.display().to_string(),
+            "--resume",
+            "--allow-data-loss",
+            "--no-backup",
+            "--yes",
+        ])));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(fs::read(&dst).unwrap(), data);
+
+        // Con --verify (contraste bloque a bloque) sobre un destino honesto.
+        let dst2 = dir.join("dest2.raw");
+        fs::write(&dst2, vec![0u8; sectors as usize * 512]).unwrap();
+        let code = cli_clone(&parse_common(&s(&[
+            "--from",
+            &src.display().to_string(),
+            "--dev",
+            &dst2.display().to_string(),
+            "--map",
+            &dir.join("clon2.map").display().to_string(),
+            "--verify",
+            "--allow-data-loss",
+            "--no-backup",
+            "--yes",
+        ])));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(fs::read(&dst2).unwrap(), data, "el contraste no altera el resultado");
+
+        // Destino más pequeño que el rango: puerta de tamaño (exit 2).
+        let small = dir.join("pequeno.raw");
+        fs::write(&small, vec![0u8; 200 * 512]).unwrap();
+        let code = cli_clone(&parse_common(&s(&[
+            "--from",
+            &src.display().to_string(),
+            "--dev",
+            &small.display().to_string(),
+            "--map",
+            &dir.join("clon3.map").display().to_string(),
+            "--allow-data-loss",
+            "--no-backup",
+            "--yes",
+        ])));
+        assert_eq!(code, ExitCode::from(2), "el destino debe cubrir el rango clonado");
+        assert!(fs::read(&small).unwrap().iter().all(|&b| b == 0), "no se tocó nada");
+
+        // Sin --allow-data-loss pero con todo lo demás: puerta 3, intacto.
+        // (usa un destino del tamaño correcto para llegar hasta la puerta).
+        let code = cli_clone(&parse_common(&s(&[
+            "--from",
+            &src.display().to_string(),
+            "--dev",
+            &dst.display().to_string(),
+            "--map",
+            &dir.join("clon4.map").display().to_string(),
+            "--no-backup",
+        ])));
+        assert_eq!(code, ExitCode::from(3));
+        assert_eq!(fs::read(&dst).unwrap(), data, "sin permiso no se toca nada");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// La rama de abort del process_run vuelca los records parciales a la

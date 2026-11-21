@@ -102,6 +102,11 @@ pub struct RescueOptions {
     pub max_error_rate: Option<u64>,
     /// Muestra un avance hex+ASCII del último sector leído bien (0 = off).
     pub preview_lines: usize,
+    /// Tras escribir un bloque, relectura de contraste en el DESTINO: si el
+    /// medio no devuelve lo escrito, el rescate/clonado aborta con el mapfile
+    /// guardado (`--verify` en `clone`; el `compare` de ddrescue en su forma
+    /// más simple). Coste: duplica las lecturas del destino.
+    pub verify_dest: bool,
 }
 
 impl Default for RescueOptions {
@@ -121,6 +126,7 @@ impl Default for RescueOptions {
             min_read_rate: MinRate::Off,
             max_error_rate: None,
             preview_lines: 0,
+            verify_dest: false,
         }
     }
 }
@@ -294,22 +300,25 @@ impl Drop for ImageBackup {
     }
 }
 
-/// Copia el bloque `src → img` solo después de respaldar en `bak` el contenido
-/// que la imagen tiene ahora en ese rango. Orden deliberado: primero se LEE
+/// Copia el bloque `src → dst` solo después de respaldar en `bak` el contenido
+/// que el DESTINO tiene ahora en ese rango. Orden deliberado: primero se LEE
 /// el origen (si falla, no hay nada que escribir ni respaldar).
 /// `slow_over`: presupuesto de lectura de la fase directa; si la lectura
 /// termina bien pero tardó más que el presupuesto, el bloque se declara
-/// `Slow` ANTES de respaldar o escribir (la imagen no se toca). Devuelve la
+/// `Slow` ANTES de respaldar o escribir (el destino no se toca). Devuelve la
 /// duración real de la lectura.
+/// `verify_dest`: tras escribir, el bloque se relee del destino y se compara
+/// con lo escrito — una discrepancia es `Fatal` (el mapfile queda guardado).
 fn try_block(
     src: &mut dyn SectorSource,
-    img: &mut FileImage,
+    dst: &mut dyn SectorSource,
     bak: Option<&mut ImageBackup>,
     lba: u64,
     n: usize,
     buf: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
     slow_over: Option<Duration>,
+    verify_dest: bool,
 ) -> Result<Duration, TryErr> {
     buf.resize(n * SECTOR_SIZE, 0);
     let t = Instant::now();
@@ -322,11 +331,26 @@ fn try_block(
     }
     if let Some(b) = bak {
         scratch.resize(n * SECTOR_SIZE, 0);
-        img.read_chunk(lba, n, scratch).map_err(TryErr::Fatal)?;
+        dst.read_chunk(lba, n, scratch).map_err(TryErr::Fatal)?;
         b.put_chunk(lba, &scratch[..n * SECTOR_SIZE])
             .map_err(TryErr::Fatal)?;
     }
-    img.write_chunk(lba, n, buf).map_err(TryErr::Fatal)?;
+    dst.write_chunk(lba, n, buf).map_err(TryErr::Fatal)?;
+    if verify_dest {
+        // Contraste de lo recién escrito (el `compare` de ddrescue en su
+        // forma más simple): el medio destino miente ⇒ abortar con mapa.
+        scratch.resize(n * SECTOR_SIZE, 0);
+        dst.read_chunk(lba, n, scratch).map_err(TryErr::Fatal)?;
+        if scratch[..n * SECTOR_SIZE] != buf[..n * SECTOR_SIZE] {
+            return Err(TryErr::Fatal(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "el destino no devolvió lo que se le escribió (sectores {lba}..{})",
+                    lba + n as u64
+                ),
+            )));
+        }
+    }
     Ok(dur)
 }
 
@@ -357,7 +381,7 @@ fn emit_progress<F: FnMut(&Progress)>(
 
 pub fn run_rescue(
     src: &mut dyn SectorSource,
-    img: &mut FileImage,
+    dst: &mut dyn SectorSource,
     map: &mut MapFile,
     opts: &RescueOptions,
     map_path: &Path,
@@ -482,7 +506,7 @@ pub fn run_rescue(
         while pos < a + len {
             let n = opts.block.min((a + len - pos) as usize).max(1);
             let budget = slow_budget(n, copied_bytes, t0.elapsed());
-            match try_block(src, img, bak.as_mut(), pos, n, &mut buf, &mut scratch, budget) {
+            match try_block(src, dst, bak.as_mut(), pos, n, &mut buf, &mut scratch, budget, opts.verify_dest) {
                 Ok(_) => {
                     map.set(pos, n as u64, MapStatus::Good, 0);
                     blocks_ok += 1;
@@ -546,7 +570,7 @@ pub fn run_rescue(
                 if sl == 0 {
                     continue;
                 }
-                match try_block(src, img, bak.as_mut(), sa, sl as usize, &mut buf, &mut scratch, None) {
+                match try_block(src, dst, bak.as_mut(), sa, sl as usize, &mut buf, &mut scratch, None, opts.verify_dest) {
                     Ok(_) => {
                         map.set(sa, sl, MapStatus::Good, 0);
                         blocks_ok += 1;
@@ -596,7 +620,7 @@ pub fn run_rescue(
     for lba in singles {
             let mut recovered = false;
             for attempt in 1..=opts.retries.max(1) {
-                match try_block(src, img, bak.as_mut(), lba, 1, &mut buf, &mut scratch, None) {
+                match try_block(src, dst, bak.as_mut(), lba, 1, &mut buf, &mut scratch, None, opts.verify_dest) {
                     Ok(_) => {
                         map.set(lba, 1, MapStatus::Good, attempt - 1);
                         blocks_ok += 1;
@@ -649,7 +673,7 @@ pub fn run_rescue(
             while pos_ex > a {
                 let n = opts.block.min((pos_ex - a) as usize).max(1);
                 pos_ex -= n as u64;
-                match try_block(src, img, bak.as_mut(), pos_ex, n, &mut buf, &mut scratch, None) {
+                match try_block(src, dst, bak.as_mut(), pos_ex, n, &mut buf, &mut scratch, None, opts.verify_dest) {
                     Ok(_) => {
                         map.set(pos_ex, n as u64, MapStatus::Good, 0);
                         blocks_ok += 1;
@@ -801,6 +825,7 @@ mod tests {
             min_read_rate: MinRate::Off,
             max_error_rate: None,
             preview_lines: 0,
+            verify_dest: false,
         }
     }
 
@@ -1118,6 +1143,71 @@ mod tests {
         o.backup = Some(dir.clone()); // un directorio no es un archivo
         let err = run_rescue(&mut src, &mut img, &mut map, &o, &dir.join("own.map"), |_| {});
         assert!(err.is_err(), "sin sidecar accesible el rescate debe negarse a empezar");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Destino de prueba que acepta escrituras pero al releer devuelve ceros:
+    /// modela un medio que «miente» sobre lo que guardó.
+    struct Amnesico {
+        sectors: u64,
+    }
+    impl SectorSource for Amnesico {
+        fn sector_count(&self) -> u64 {
+            self.sectors
+        }
+        fn read_sector(&mut self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> io::Result<()> {
+            if lba >= self.sectors {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "fuera de rango"));
+            }
+            buf.fill(0);
+            Ok(())
+        }
+        fn write_sector(&mut self, _lba: u64, _buf: &[u8; SECTOR_SIZE]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn verify_dest_aborta_si_el_destino_miente() {
+        // Con el contraste activado, un destino que no devuelve lo escrito
+        // aborta (Fatal) y deja el mapfile guardado para reanudar.
+        let dir = tmpdir("vfy1");
+        let sectors = 64u64;
+        let map_path = dir.join("c.map");
+        let mut map = MapFile::new(sectors);
+        let mut src = MockRescue::new(sectors);
+        let mut dst = Amnesico { sectors };
+        let mut o = opts(sectors, 8, 1, false);
+        o.verify_dest = true;
+        let e = run_rescue(&mut src, &mut dst, &mut map, &o, &map_path, |_| {}).unwrap_err();
+        assert!(
+            e.to_string().contains("no devolvió lo que se le escribió"),
+            "mensaje inesperado: {e}"
+        );
+        assert!(map_path.exists(), "el mapa debe quedar guardado en el abort");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_dest_con_destino_honesto_completa_igual() {
+        // Contraste activado sobre un destino normal: resultado idéntico al
+        // rescate sin contraste (solo más lecturas del destino).
+        let dir = tmpdir("vfy2");
+        let sectors = 256u64;
+        let img_path = dir.join("d.raw");
+        let map_path = dir.join("d.map");
+        let mut map = MapFile::new(sectors);
+        let mut src = MockRescue::new(sectors);
+        src.poison(70);
+        let mut img = prepare_image(&img_path, sectors).unwrap();
+        let mut o = opts(sectors, 16, 2, true);
+        o.verify_dest = true;
+        let rep = run_rescue(&mut src, &mut img, &mut map, &o, &map_path, |_| {}).unwrap();
+        assert_eq!(rep.good, sectors - 1);
+        assert_eq!(rep.scraped, 1);
+        let bytes = fs::read(&img_path).unwrap();
+        let off = 71 * SECTOR_SIZE;
+        assert_eq!(bytes[off], MockRescue::byte_for(71), "el contraste no altera lo copiado");
         let _ = fs::remove_dir_all(&dir);
     }
 }

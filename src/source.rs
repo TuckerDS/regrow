@@ -91,6 +91,21 @@ pub trait SectorSource {
         Ok(())
     }
 
+    /// Escritura bulk de `count` sectores contiguos (el camino del clonado).
+    /// Implementación por defecto: sector a sector. `FileImage` la sobrescribe
+    /// con una sola escritura contigua; `RawDisk` la hace por cargas alineadas
+    /// (o lectura-modificación-escritura por bloque físico en 4Kn, preservando
+    /// los sectores vecinos de los bordes del chunk).
+    fn write_chunk(&mut self, lba: u64, count: usize, buf: &[u8]) -> io::Result<()> {
+        debug_assert_eq!(buf.len(), count * SECTOR_SIZE);
+        let mut tmp = [0u8; SECTOR_SIZE];
+        for i in 0..count {
+            tmp.copy_from_slice(&buf[i * SECTOR_SIZE..(i + 1) * SECTOR_SIZE]);
+            self.write_sector(lba + i as u64, &tmp)?;
+        }
+        Ok(())
+    }
+
     /// Comprueba `count` sectores contiguos sin transferir su contenido a
     /// espacio de usuario (el READ VERIFY del firmware, U5b). La
     /// implementación por defecto —imágenes y medios sin acceso ATA directo—
@@ -159,20 +174,6 @@ impl FileImage {
         Ok(Self { file, sectors })
     }
 
-    /// Escritura bulk de `count` sectores contiguos (usada por el rescate).
-    pub fn write_chunk(&mut self, lba: u64, count: usize, buf: &[u8]) -> io::Result<()> {
-        self.check(lba)?;
-        let need = count * SECTOR_SIZE;
-        if lba + count as u64 > self.sectors || buf.len() < need {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "chunk fuera de la imagen",
-            ));
-        }
-        self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
-        self.file.write_all(&buf[..need])
-    }
-
     fn check(&self, lba: u64) -> io::Result<()> {
         if lba >= self.sectors {
             return Err(io::Error::new(
@@ -213,6 +214,19 @@ impl SectorSource for FileImage {
         }
         self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
         self.file.read_exact(&mut buf[..need])
+    }
+
+    fn write_chunk(&mut self, lba: u64, count: usize, buf: &[u8]) -> io::Result<()> {
+        self.check(lba)?;
+        let need = count * SECTOR_SIZE;
+        if lba + count as u64 > self.sectors || buf.len() < need {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk fuera de la imagen",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
+        self.file.write_all(&buf[..need])
     }
 }
 
@@ -787,6 +801,67 @@ impl SectorSource for RawDisk {
             }
             blk += m as u64;
         }
+        Ok(())
+    }
+
+    /// Escritura bulk (el camino del `clone`). En modo búfer: una escritura
+    /// contigua (O_SYNC ya garantiza la llegada al medio). En modo estricto
+    /// (O_DIRECT / NO_BUFFERING / 4Kn): por cargas a través del búfer alineado.
+    /// En 4Kn los bloques físicos de los bordes se someten a
+    /// lectura-modificación-escritura para preservar los sectores vecinos.
+    fn write_chunk(&mut self, lba: u64, count: usize, buf: &[u8]) -> io::Result<()> {
+        let need = count * SECTOR_SIZE;
+        if lba >= self.sectors || lba as u64 + count as u64 > self.sectors || buf.len() < need {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("chunk LBA {}×{} fuera del medio", lba, count),
+            ));
+        }
+        if !self.bulk_stage {
+            self.file.seek(SeekFrom::Start(lba * SECTOR_SIZE as u64))?;
+            self.file.write_all(&buf[..need])?;
+        } else if self.phys == SECTOR_SIZE {
+            let per_iter = BULK_BYTES / SECTOR_SIZE;
+            let mut done = 0usize;
+            while done < count {
+                let n = per_iter.min(count - done);
+                let src = &buf[done * SECTOR_SIZE..(done + n) * SECTOR_SIZE];
+                self.bulk.0[..n * SECTOR_SIZE].copy_from_slice(src);
+                self.file.seek(SeekFrom::Start((lba + done as u64) * SECTOR_SIZE as u64))?;
+                self.file.write_all(&self.bulk.0[..n * SECTOR_SIZE])?;
+                done += n;
+            }
+        } else {
+            // 4Kn: bloque físico a bloque físico; los bordes preservan vecinos.
+            let phys = self.phys;
+            let byte_lo = lba * SECTOR_SIZE as u64;
+            let byte_hi = byte_lo + need as u64;
+            let (blk_lo, nblocks) = phys_range_blocks(lba, count, phys);
+            for k in 0..nblocks {
+                let wbase = (blk_lo + k) * phys as u64;
+                let i0 = wbase.max(byte_lo);
+                let i1 = (wbase + phys as u64).min(byte_hi);
+                self.file.seek(SeekFrom::Start(wbase))?;
+                if i0 > wbase || i1 < wbase + phys as u64 {
+                    // borde: el bloque se reescribe entero, hay que conservar
+                    // lo que no pertenece al chunk (si está ilegible, NO se
+                    // escribe: destruiría vecinos legibles)
+                    self.file.read_exact(&mut self.bulk.0[..phys])?;
+                }
+                let off0 = (i0 - wbase) as usize;
+                let src0 = (i0 - byte_lo) as usize;
+                let len = (i1 - i0) as usize;
+                self.bulk.0[off0..off0 + len].copy_from_slice(&buf[src0..src0 + len]);
+                self.file.seek(SeekFrom::Start(wbase))?;
+                self.file.write_all(&self.bulk.0[..phys])?;
+            }
+        }
+        self.wrote = true;
+        // O_SYNC/O_DIRECT ya entregaron los datos; invalida la caché del
+        // kernel para que nadie (ni nuestra propia comprobación de contraste)
+        // vea el contenido anterior.
+        #[cfg(target_os = "linux")]
+        self.flush_bufs();
         Ok(())
     }
 
@@ -1555,6 +1630,61 @@ mod tests {
         let e = img.verify_chunk(195, 10, Duration::from_secs(5));
         assert!(e.is_err(), "verificar más allá del fin debe fallar");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_chunk` (el camino del clonado): ida y vuelta por el trait dinámico,
+    /// con guardas de rango. El default del trait (sector a sector) se prueba
+    /// con un backend que solo implementa read/write_sector.
+    #[test]
+    fn write_chunk_round_trip_y_guardas() {
+        let dir = std::env::temp_dir().join(format!("regrow_wch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("w.raw");
+        let mut img = FileImage::create(&p, 300).unwrap();
+        let s: &mut dyn SectorSource = &mut img;
+        let data: Vec<u8> = (0..(16 * SECTOR_SIZE)).map(|i| (i % 251) as u8).collect();
+        s.write_chunk(10, 16, &data).unwrap();
+        let mut back = vec![0u8; 16 * SECTOR_SIZE];
+        s.read_chunk(10, 16, &mut back).unwrap();
+        assert_eq!(back, data, "el chunk vuelve idéntico");
+        // Vecinos intactos (hueco sparse).
+        let mut edge = [0u8; SECTOR_SIZE];
+        s.read_sector(9, &mut edge).unwrap();
+        assert!(edge.iter().all(|&b| b == 0));
+        s.read_sector(26, &mut edge).unwrap();
+        assert!(edge.iter().all(|&b| b == 0));
+        // Fuera de rango: error, no escritura parcial.
+        assert!(s.write_chunk(295, 8, &data).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// El `write_chunk` default del trait (backend sin override) delega en
+    /// write_sector sector a sector.
+    #[test]
+    fn write_chunk_default_del_trait_usa_write_sector() {
+        struct SoloSectores {
+            writes: std::cell::RefCell<Vec<u64>>,
+        }
+        impl SectorSource for SoloSectores {
+            fn sector_count(&self) -> u64 {
+                100
+            }
+            fn read_sector(&mut self, _lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> io::Result<()> {
+                buf.fill(0);
+                Ok(())
+            }
+            fn write_sector(&mut self, lba: u64, _buf: &[u8; SECTOR_SIZE]) -> io::Result<()> {
+                self.writes.borrow_mut().push(lba);
+                Ok(())
+            }
+        }
+        let mut s = SoloSectores {
+            writes: std::cell::RefCell::new(Vec::new()),
+        };
+        let data = vec![0xA5u8; 4 * SECTOR_SIZE];
+        s.write_chunk(50, 4, &data).unwrap();
+        assert_eq!(*s.writes.borrow(), vec![50, 51, 52, 53]);
     }
 
     #[test]

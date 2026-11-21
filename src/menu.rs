@@ -743,6 +743,7 @@ mod tests {
             requeue: false,
             preview: None,
             log_rates: None,
+            from: None,
             verify: false,
             timeout_secs: 30,
             yes: false,
