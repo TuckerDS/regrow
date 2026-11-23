@@ -6,6 +6,18 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Added
+
+- `maps`: operaciones entre mapfiles que nunca tocan discos ni imágenes.
+  `status` (resumen por estado), `done` (test de rescate completo; sale 0 si
+  está todo), `diff` (contrastar dos mapas; sale 1 si difieren, con
+  `--finished-only` para mirar solo lo terminado), `merge --mode or|and|xor`
+  (fusionar lo terminado de dos o más pasadas), `invert`, `complete`,
+  `retype`, `shift`, `list` (exportar bloques como lista estilo badblocks o
+  bitmap 1 bit/sector, BE/LE), `from-list` (crear un mapa desde una lista
+  badblocks o un bitmap), e `import`/`export` de mapfiles de texto
+  compatibles con ddrescue. Ningún orden escribe sobre medios.
+
 ## [0.3.0] - 2026-11-21
 
 ### Added

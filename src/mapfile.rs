@@ -99,7 +99,7 @@ pub struct MapEntry {
 
 /// Mapa de dominio [0, sector_count). Solo se almacenan rangos con estado
 /// conocido; un hueco entre rangos equivale a `Failed` sin reintentar.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MapFile {
     pub sector_count: u64,
     entries: Vec<MapEntry>,

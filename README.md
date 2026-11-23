@@ -67,7 +67,8 @@ Versión **0.3.0** — en uso sobre operaciones de recuperación reales.
 | `scan` / `repair` / `refresh` / `regenerate` / `prescan` / `speedtest` / `smart` / `selftest` | panel TUI interactivo mejorado |
 | `rescue`: disco→imagen por fases (bloques directos, división binaria, rascado sector a sector, pasada inversa) con sidecar de respaldo previo | *file carving* |
 | Control de ritmo y reanudación del rescate: `--rate-limit`, `--min-read-rate`, `--max-error-rate`, `--requeue`, `--preview`, `--log-rates` | firmas de particiones y sectores de arranque |
-| `rescue --generate-map` (herencias de `dd`: el mapa se deduce de la imagen) y `--skip-adaptive` (salto adaptativo tras bloques fallidos) | operaciones entre mapfiles (fusionar/contrastar dos mapas) |
+| `rescue --generate-map` (herencias de `dd`: el mapa se deduce de la imagen) y `--skip-adaptive` (salto adaptativo tras bloques fallidos) | *file carving* |
+| `maps`: operaciones entre mapfiles sin tocar discos — fusionar (`merge --mode or/and/xor`), contrastar (`diff`), resumen (`status`), test de rescate completo (`done`), transformar (`invert`/`complete`/`retype`/`shift`), importar/exportar listas badblocks, bitmaps y mapfiles de texto | firmas de particiones y sectores de arranque |
 | `clone --from PATH --raw N \| --dev PATH`: clonado sector a sector con las fases y el mapfile reanudable del rescate | |
 | `sanitize <modo>`: saneado completo del medio, delegado a las herramientas del sistema y con doble confirmación | |
 | Verificación directa del firmware (`--verify`, `--timeout`): comprueba bloques sin transferir su contenido; donde el medio no la expone, degrada a lecturas normales y lo dice | |
