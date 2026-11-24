@@ -294,6 +294,7 @@ fn run_with(reader: &mut dyn BufRead, o: &CommonOpts) -> ExitCode {
         println!("5. Battery multipatrón (probar la escritura con 00/AA/55/FF y restaurar el contenido)");
         println!("6. Ver estadísticas");
         println!("7. Salir");
+        println!("f. Ver capa lógica sin montar (fs status: firmas, layout y estado según el mapa; solo lectura)");
         let choice = match ask(reader, "Elige [1-7]: ") {
             Some(c) => c,
             None => break,
@@ -309,10 +310,28 @@ fn run_with(reader: &mut dyn BufRead, o: &CommonOpts) -> ExitCode {
                 continue;
             }
             "7" => break,
+            "f" | "F" => {
+                // la orden nueva del bloque: sobre el destino activo del menú.
+                let mut args: Vec<String> = vec!["status".into()];
+                if let Some(p) = &o.image {
+                    args.push(p.display().to_string());
+                }
+                if let Some(n) = o.raw {
+                    args.extend_from_slice(&["--raw".into(), n.to_string()]);
+                }
+                if let Some(p) = &o.dev {
+                    args.extend_from_slice(&["--dev".into(), p.display().to_string()]);
+                }
+                if let Some(m) = &o.map_path {
+                    args.extend_from_slice(&["--map".into(), m.display().to_string()]);
+                }
+                let _ = crate::fsops::cli_fs(&args);
+                continue;
+            }
             // Línea vacía: repite el menú sin ruido de error.
             "" => continue,
             _ => {
-                println!("opción inválida (usa 1-7)");
+                println!("opción inválida (usa 1-7 o f)");
                 continue;
             }
         };
@@ -991,6 +1010,23 @@ mod tests {
         let t001 = fs::read_to_string(o.log_dir.join("DISK43.001")).unwrap();
         assert!(t001.contains("10=B2"), "el log cortado queda en .001: {t001}");
         assert!(!state_path(&o.log_dir, 43).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Opción «f» del menú (capa lógica fs status, solo lectura): debe
+    /// ejecutarse sobre el destino activo y devolver al menú sin romperlo.
+    #[test]
+    fn menu_capa_logica_devuelve_al_menu() {
+        let dir = temp_dir("fscapa");
+        let img = dir.join("img.raw");
+        fs::write(&img, vec![0u8; 16 * 512]).unwrap();
+        let o = opts(img, &dir, 79);
+        // f (fs status sin mapa) → el menú se repite → salir (7).
+        let mut input = std::io::Cursor::new(b"f\n7\n");
+        let code = run_with(&mut input, &o);
+        assert_eq!(code, ExitCode::SUCCESS);
+        // fs status jamás escribe: ni logs ni checkpoints nuevos.
+        assert!(!o.log_dir.join("DISK79.LOG").exists());
         fs::remove_dir_all(&dir).ok();
     }
 }

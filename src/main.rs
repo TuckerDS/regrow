@@ -25,6 +25,7 @@ mod backup;
 mod config;
 mod engine;
 mod fill;
+mod fsops;
 mod log;
 mod mapfile;
 mod mapops;
@@ -145,6 +146,12 @@ fn usage() -> ! {
          \x20                    anotar un mapa como texto comentado (annotate), y\n\
          \x20                    importar/exportar listas estilo badblocks y bitmaps.\n\
          \x20                    `regrow maps` a secas describe cada orden.\n\
+         \x20 regrow fs <status|ls|report> <imagen|--raw N|--dev PATH> [--map M] [--partition N]\n\
+         \x20                    capa lógica de SOLO LECTURA: firmas y layout (MBR/GPT,\n\
+         \x20                    NTFS/FAT32) con estado según el mapa, listado de la $MFT sin\n\
+         \x20                    montar, e informe JSONL de los metadatos que mueren en cada\n\
+         \x20                    tramo pendiente. Nunca escribe en medios ni imágenes.\n\
+         \x20                    `regrow fs` a secas describe cada orden.\n\
          \x20 regrow menu [imagen|--raw N|--dev PATH] [opciones]\n\
          \x20 --start N          primer sector (def 0)\n\
          \x20 --end N            último sector exclusivo (def: total)\n\
@@ -611,6 +618,7 @@ pub fn main() -> ExitCode {
         "clone" => cli_clone(&parse_common(&args[1..])),
         "surfmap" => cli_surfmap(&parse_common(&args[1..])),
         "maps" => mapops::cli_maps(&args[1..]),
+        "fs" => fsops::cli_fs(&args[1..]),
         "prescan" => cli_prescan(&parse_common(&args[1..])),
         "speedtest" => cli_speedtest(&parse_common(&args[1..])),
         "scan" => cli_pass(&parse_common(&args[1..]), RunMode::Scan),
