@@ -15,3 +15,7 @@
 
 # SO
 .DS_Store
+
+# Fixtures binarios extraídos de volumenes reales: privados, nunca al repo.
+# Los tests que los usan se saltan limpiamente si faltan.
+/tests/fixtures/

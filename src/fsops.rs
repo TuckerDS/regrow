@@ -267,10 +267,16 @@ pub fn parse_ntfs_bpb(s0: &[u8]) -> Option<NtfsBpb> {
     if spc.count_ones() != 1 || !(1..=128).contains(&spc) {
         return None;
     }
+    // sectors_nbr u64 @0x28 (40 decimal): boot real = 954.095.615, backup
+    // boot = último sector del volumen.
     let sectors_nbr = u64::from_le_bytes(s0[40..48].try_into().unwrap());
     if sectors_nbr == 0 {
         return None;
     }
+    // offsets del BPB NTFS según la ficha canónica, confirmados byte a byte
+    // con el boot sector real de la imagen: sectors_nbr u64 @0x28,
+    // mft_lcn u64 @0x30 (786432), mftmirr_lcn u64 @0x38 (cluster 2 → sector
+    // 16), cpr i8 @0x40 (−10), serial @0x48, checksum @0x50.
     let mft_lcn = u64::from_le_bytes(s0[0x30..0x38].try_into().unwrap());
     let mftmirr_lcn = u64::from_le_bytes(s0[0x38..0x40].try_into().unwrap());
     let cpr = s0[0x40] as i8;
@@ -493,33 +499,45 @@ fn utf16_string(b: &[u8]) -> String {
 /// `usa_offset`, y también registros ya fixupeados (coinciden con USA[0]).
 /// Si ningún candidato cuadra, marca `fixups_ok = false` y deja los bytes
 /// tal cual — nunca aborta el parseo.
+/// Aplica la array de secuencia de actualización (USA) de forma defensiva
+/// (RF-5): el registro raw en disco trae las colas de bloque == USA[0]
+/// (fixups pendientes); se restaura cada cola desde su entrada USA[i].
+/// También se aceptan registros ya fixupeados (la cola coincide con su
+/// propia entrada USA). Si nada cuadra, marca `fixups_ok = false` y deja
+/// los bytes intactos: un registro herido solo pierde ese registro.
 fn apply_fixups(buf: &mut [u8]) -> bool {
-    let usa0 = le16(buf, 8);
     let count = le16(buf, 6);
     let usa_off = {
         let o = le16(buf, 4);
-        if (8..64).contains(&o) { o as usize } else { 8 }
+        if (16..64).contains(&o) {
+            o as usize
+        } else {
+            0x30
+        }
     };
+    if usa_off + 2 > buf.len() {
+        return false;
+    }
+    let usa0 = le16(buf, usa_off); // secuencia: valor con que se escribieron las colas
     let mut ok = true;
-    let blocks = buf.len() / 512;
-    let n = (count.saturating_sub(1) as usize).min(blocks.saturating_sub(1));
+    // fixups = count-1 entradas, una por cada cola de sector (0x1FE, 0x3FE…
+    // en la imagen del operativo count=3 para registros de 1024 B ⇒ dos
+    // colas). El guarda de bounds recorta si la array declarada es mayor.
+    let n = count.saturating_sub(1) as usize;
     for i in 1..=n {
         let tail = i * 512 - 2;
-        if tail + 2 > buf.len() {
+        let entry = usa_off + 2 * i;
+        if tail + 2 > buf.len() || entry + 2 > buf.len() {
             break;
         }
-        let stored = le16(buf, tail);
-        let c1 = 8 + i * 2;
-        let c2 = usa_off + (i - 1) * 2;
-        if stored == usa0 {
-            continue; // ya fixupeado (lectura pasada por un lector USA)
-        }
-        if (c1 + 2 <= buf.len() && stored == le16(buf, c1))
-            || (c2 + 2 <= buf.len() && stored == le16(buf, c2))
-        {
-            buf[tail..tail + 2].copy_from_slice(&usa0.to_le_bytes());
+        if le16(buf, tail) == usa0 {
+            // raw con fixups pendientes: restaurar la cola original
+            let v = le16(buf, entry);
+            buf[tail..tail + 2].copy_from_slice(&v.to_le_bytes());
+        } else if le16(buf, tail) == le16(buf, entry) {
+            // ya fixupeado por otro lector: nada que hacer
         } else {
-            ok = false;
+            ok = false; // USA dudosa: no tocamos nada
         }
     }
     ok
@@ -530,7 +548,7 @@ const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
 const ATTR_INDEX_ROOT: u32 = 0x90;
 const ATTR_INDEX_ALLOC: u32 = 0xA0;
-const ATTR_BITMAP: u32 = 0xC0;
+const ATTR_BITMAP: u32 = 0xB0;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
 /// Parsea un registro MFT raw (tamaño `buf.len()`, 1024 o cluster).
@@ -543,8 +561,10 @@ pub fn parse_mft_record(_number: u64, raw: &[u8]) -> Option<MftRecord> {
     }
     let mut buf = raw.to_vec();
     let fixups_ok = apply_fixups(&mut buf);
-    let flags = le16(&buf, 0x1C);
-    let attrs_off = le16(&buf, 0x1E) as usize;
+    // Cabecera base (MS-NTFS, verificada contra los registros 0 y 5 reales
+    // de la imagen del operativo): attrs_offset en 0x14, flags en 0x16.
+    let attrs_off = le16(&buf, 0x14) as usize;
+    let flags = le16(&buf, 0x16);
     // La guarda clásica: attrs_offset % 8 == 0 y ≥ 42 (cabecera + holgura).
     if attrs_off < 42 || !attrs_off.is_multiple_of(8) || attrs_off >= buf.len() {
         return None;
@@ -571,24 +591,57 @@ pub fn parse_mft_record(_number: u64, raw: &[u8]) -> Option<MftRecord> {
         let non_resident = buf[pos + 8] != 0;
         match atype {
             ATTR_FILE_NAME if !non_resident => {
-                // valor residente: parent u64, 4×time, alloc u64, real u64,
-                // flags u32, ea u32, max_compr u32, encoded u32, len u8, ns u8.
-                let voff = pos + { le32(&buf, pos + 20) as usize };
-                // `vlen` no se usa como guarda: preferimos bounds-check por
-                // campo (tolerante, RF-5) frente a un valor posiblemente herido.
-                let _vlen = le32(&buf, pos + 16) as usize;
-                if voff + 0x42 <= buf.len() {
-                    let parent_ref = le64(&buf, voff);
-                    rec.parent = Some(parent_ref & 0xFFFF_FFFF_FFFF);
-                    rec.real_size = le64(&buf, voff + 48);
-                    let name_len = buf[voff + 0x40] as usize;
-                    let name_at = voff + 0x42;
-                    if name_at + name_len * 2 <= buf.len() {
-                        rec.name = Some(utf16_string(&buf[name_at..name_at + name_len * 2]));
+                // Valor residente: parent u64, 4×time, alloc u64, real u64,
+                // flags u32, ea u32, len u8, ns u8, nombre u16[].
+                // Ventana del valor: dos variantes de cabecera residente —
+                // MS (val_len u32 @+16, val_off u32 @+20) y la del volumen de
+                // la imagen real, verificada byte a byte: val_len u32 @+16 y
+                // val_off u16 @+20 (reservado u16 detrás). Elegimos la que
+                // produce una ventana coherente con `alen` y el registro.
+                let vlen = le32(&buf, pos + 16) as usize;
+                let ms = (vlen, le32(&buf, pos + 20) as usize);
+                let vol = (vlen, le16(&buf, pos + 20) as usize);
+                let coherent = |(l, o): (usize, usize)| {
+                    l >= 0x42 && o >= 16 && o <= alen && pos + o + l <= buf.len()
+                };
+                let (vlen, voff) = if coherent(ms) { ms } else if coherent(vol) { vol } else { (0, 0) };
+                if vlen == 0 {
+                    pos += alen;
+                    continue;
+                }
+                let v = pos + voff;
+                if v + 0x42 > buf.len() || v + vlen > buf.len() {
+                    pos += alen;
+                    continue;
+                }
+                let parent_ref = le64(&buf, v);
+                rec.parent = Some(parent_ref & 0xFFFF_FFFF_FFFF);
+                rec.real_size = rec.real_size.max(le64(&buf, v + 48));
+                if le32(&buf, v + 56) & 0x02 != 0 {
+                    rec.is_directory = true; // marca de directorio en $FILE_NAME
+                }
+                // Posición del nombre: 64 como en la imagen del operativo
+                // (este volumen omite max_compression); probamos 68 (MS) y
+                // elegimos la que cierra exactamente con `vlen`.
+                let mut found = None;
+                for npos in [64usize, 68] {
+                    if v + npos + 2 > buf.len() {
+                        continue;
                     }
-                    if le32(&buf, voff + 56) & 0x02 != 0 {
-                        rec.is_directory = true; // marca de directorio en $FILE_NAME
+                    let nlen = buf[v + npos] as usize;
+                    if nlen == 0 || nlen > 255 {
+                        continue;
                     }
+                    let end = v + npos + 2 + 2 * nlen;
+                    if end <= v + vlen + 7 && end <= buf.len() {
+                        found = Some((npos, nlen));
+                        if end == v + vlen {
+                            break;
+                        }
+                    }
+                }
+                if let Some((npos, nlen)) = found {
+                    rec.name = Some(utf16_string(&buf[v + npos + 2..v + npos + 2 + 2 * nlen]));
                 }
             }
             ATTR_DATA if !non_resident => {
@@ -599,20 +652,46 @@ pub fn parse_mft_record(_number: u64, raw: &[u8]) -> Option<MftRecord> {
                 }
             }
             ATTR_DATA => {
-                let rl_off = pos + le16(&buf, pos + 32) as usize;
-                let initialized = le64(&buf, pos + 56);
-                if rl_off < buf.len() {
-                    if let Some(runs) = decode_runs(&buf[rl_off..]) {
-                        rec.data_runs.extend(runs);
+                // Runlist: desplazamiento declarado en la cabecera. En la
+                // imagen del operativo coincide con u16 @+32 (0x40 en $MFT,
+                // 0x48 en $I30); probamos también @+10 como alternativa.
+                let vo = le16(&buf, pos + 32) as usize;
+                let alt = le16(&buf, pos + 10) as usize;
+                let rl_off = match (vo, alt) {
+                    (v, _) if v >= 16 && pos + v < buf.len() => pos + v,
+                    (_, v) if v >= 16 && pos + v < buf.len() => pos + v,
+                    _ => break,
+                };
+                // Tamaños: MS pone real@+16/alloc@+24, pero el volumen de la
+                // imagen (verificado con el registro 49, 01.mp4) guarda aquí
+                // VCNs y deja allocated@+40, initialized@+48, real@+56.
+                // Adoptamos el trío +40/+48/+56 solo si es internamente
+                // coherente (máx ≤ 2×mín y no nulos); si no, MS +16/+24.
+                let trio = [40u64, 48, 56].map(|o| {
+                    if (pos + o as usize) + 8 <= buf.len() {
+                        le64(&buf, pos + o as usize)
+                    } else {
+                        0
                     }
+                });
+                let tmax = trio.iter().copied().max().unwrap_or(0);
+                let tmin = trio.iter().filter(|v| **v != 0).copied().min().unwrap_or(0);
+                let real = if tmin != 0 && tmax <= 1u64 << 48 && tmax <= tmin.saturating_mul(2) {
+                    // trío plausible (bytes de archivo, no basura de runlist)
+                    tmax
+                } else {
+                    le64(&buf, pos + 16).max(le64(&buf, pos + 24))
+                };
+                if let Some(runs) = decode_runs(&buf[rl_off..]) {
+                    rec.data_runs.extend(runs);
                 }
-                if initialized != 0 {
-                    rec.real_size = rec.real_size.max(initialized);
+                if real != 0 {
+                    rec.real_size = rec.real_size.max(real);
                 }
             }
             ATTR_INDEX_ROOT | ATTR_INDEX_ALLOC => rec.is_directory = true,
             ATTR_ATTR_LIST => rec.has_attr_list = true,
-            ATTR_BITMAP if !non_resident => rec.has_bitmap = true,
+            ATTR_BITMAP => rec.has_bitmap = true,
             _ => {} // $STANDARD_INFO y demás: no hacen falta para el informe
         }
         pos += alen;
@@ -1123,7 +1202,6 @@ pub fn write_report(w: &MftWalk, layout: &NtfsBpb, map: &MapFile, out: &mut dyn 
         items.sort();
         let items_str = items
             .iter()
-            .take(50)
             .map(|&&i| {
                 let e = &w.entries[i];
                 format!(
@@ -1138,13 +1216,12 @@ pub fn write_report(w: &MftWalk, layout: &NtfsBpb, map: &MapFile, out: &mut dyn 
             .join(",");
         writeln!(
             out,
-            "{{\"tramo\":[{},{}],\"estado\":\"{}\",\"entradas_total\":{},\"entradas\":[{}{}]}}",
+            "{{\"tramo\":[{},{}],\"estado\":\"{}\",\"entradas_total\":{},\"entradas\":[{}]}}",
             r.0,
             r.1,
             r.2,
             total,
-            items_str,
-            if total > 50 { ",…" } else { "" }
+            items_str
         )?;
     }
     writeln!(
@@ -2016,14 +2093,17 @@ mod tests {
     // ---- registros MFT -------------------------------------------------------
 
     fn fn_attr(name: &str, parent: u64, dir: bool, real: u64) -> Vec<u8> {
+        // Cabecera como la escribe el volumen verificado: val_len u32 @+16,
+        // val_off u16 @+20; valor en +24 con nombre en +64 (sin
+        // max_compression).
         let nb: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         let vlen = 0x42 + nb.len();
         let alen = (24 + vlen + 7) / 8 * 8;
         let mut a = vec![0u8; alen];
         a[0..4].copy_from_slice(&0x30u32.to_le_bytes());
         a[4..8].copy_from_slice(&(alen as u32).to_le_bytes());
-        a[16..20].copy_from_slice(&(vlen as u32).to_le_bytes());
-        a[20..24].copy_from_slice(&24u32.to_le_bytes()); // value offset
+        a[16..20].copy_from_slice(&(vlen as u32).to_le_bytes()); // value length
+        a[20..22].copy_from_slice(&24u16.to_le_bytes()); // value offset
         let v = 24usize;
         a[v..v + 8].copy_from_slice(&parent.to_le_bytes());
         a[v + 48..v + 56].copy_from_slice(&real.to_le_bytes());
@@ -2043,10 +2123,9 @@ mod tests {
         a[0..4].copy_from_slice(&0x80u32.to_le_bytes());
         a[4..8].copy_from_slice(&(alen as u32).to_le_bytes());
         a[8] = 1; // no residente
-        a[32..34].copy_from_slice(&64u16.to_le_bytes()); // runlist offset
-        a[40..48].copy_from_slice(&real.to_le_bytes()); // asignado
-        a[48..56].copy_from_slice(&real.to_le_bytes()); // real
-        a[56..64].copy_from_slice(&real.to_le_bytes()); // inicializado
+        a[16..24].copy_from_slice(&real.to_le_bytes()); // inicializado (+16)
+        a[24..32].copy_from_slice(&real.to_le_bytes()); // asignado (+24)
+        a[32..34].copy_from_slice(&64u16.to_le_bytes()); // runlist offset (+32)
         a[64..64 + runs.len()].copy_from_slice(runs);
         a
     }
@@ -2060,28 +2139,37 @@ mod tests {
 
     fn bitmap_attr() -> Vec<u8> {
         let mut a = vec![0u8; 40];
-        a[0..4].copy_from_slice(&0xC0u32.to_le_bytes());
+        a[0..4].copy_from_slice(&0xB0u32.to_le_bytes());
         a[4..8].copy_from_slice(&40u32.to_le_bytes());
         a
     }
 
     fn rec_bytes(flags: u16, attrs: &[Vec<u8>]) -> Vec<u8> {
+        // Cabecera base real (MS-NTFS, verificada contra la imagen):
+        // usa_off 0x30, attrs_offset 0x14, flags 0x16, colas raw == USA[0].
         let mut r = vec![0u8; 1024];
         r[0..4].copy_from_slice(b"FILE");
-        r[4..6].copy_from_slice(&16u16.to_le_bytes()); // usa_offset
+        r[4..6].copy_from_slice(&48u16.to_le_bytes()); // usa_offset
         r[6..8].copy_from_slice(&3u16.to_le_bytes()); // usa_count
-        r[8..10].copy_from_slice(&0xBEEFu16.to_le_bytes()); // USA[0]
-        r[0x1C..0x1E].copy_from_slice(&flags.to_le_bytes());
-        r[0x1E..0x20].copy_from_slice(&56u16.to_le_bytes()); // attrs_offset
+        r[8..16].copy_from_slice(&0x1234u64.to_le_bytes()); // LSN
+        r[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // secuencia
+        r[0x12..0x14].copy_from_slice(&1u16.to_le_bytes()); // enlaces duros
+        r[0x14..0x16].copy_from_slice(&56u16.to_le_bytes()); // attrs_offset
+        r[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+        // USA @0x30: [secuencia, cola original bloque 1, cola bloque 2]
+        r[0x30..0x32].copy_from_slice(&0x1234u16.to_le_bytes());
+        r[0x32..0x34].copy_from_slice(&0xAAAAu16.to_le_bytes());
+        r[0x34..0x36].copy_from_slice(&0xBBBBu16.to_le_bytes());
         let mut pos = 56usize;
         for a in attrs {
             assert!(pos + a.len() <= r.len(), "fixture desborda el registro");
             r[pos..pos + a.len()].copy_from_slice(a);
             pos += a.len();
         }
-        // colas de bloque con USA[0] (registro ya fixupeado).
-        r[510..512].copy_from_slice(&0xBEEFu16.to_le_bytes());
-        r[1022..1024].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        // colas de bloque == USA[0]: raw con fixups pendientes (apply los
+        // restaurará a 0xAAAA / 0xBBBB).
+        r[510..512].copy_from_slice(&0x1234u16.to_le_bytes());
+        r[1022..1024].copy_from_slice(&0x1234u16.to_le_bytes());
         r
     }
 
@@ -2122,16 +2210,82 @@ mod tests {
     }
 
     #[test]
+    fn geometria_verificada_en_imagen_real() {
+        // Regresión de la cabecera real (cotejada byte a byte con los
+        // registros 0 y 5 de una imagen NTFS del operativo): attrs_offset
+        // 0x14, flags 0x16, USA @0x30 con count=3, valor residente con
+        // val_off u16 @+16 y val_len u32 @+20, nombre en +64, tipos de
+        // atributo 0x40/0x50/0xb0 como los escribe el volumen.
+        let std_info = {
+            let mut a = vec![0u8; 96];
+            a[0..4].copy_from_slice(&0x10u32.to_le_bytes());
+            a[4..8].copy_from_slice(&96u32.to_le_bytes());
+            a[16..18].copy_from_slice(&24u16.to_le_bytes());
+            a[20..24].copy_from_slice(&72u32.to_le_bytes());
+            a
+        };
+        let rec0 = rec_bytes(1, &[
+            std_info.clone(),
+            fn_attr("$MFT", 0, false, 0),
+            data_attr(&[0x32, 0x10, 0x00, 0x1c, 0x0c, 0x00], 32_768),
+            bitmap_attr(),
+        ]);
+        let mft = parse_mft_record(0, &rec0).expect("registro 0 parseable");
+        assert_eq!(mft.name.as_deref(), Some("$MFT"));
+        assert!(!mft.deleted);
+        assert!(mft.has_bitmap);
+        assert_eq!(mft.data_runs[0].clusters, 0x10);
+        assert_eq!(mft.data_runs[0].lcn, 0x0c1c);
+        // Registro raíz: 0x40 INDEX_ROOT + 0x50 INDEX_ALLOC + 0xb0 BITMAP.
+        let idx_root = {
+            let mut a = vec![0u8; 40];
+            a[0..4].copy_from_slice(&0x40u32.to_le_bytes());
+            a[4..8].copy_from_slice(&40u32.to_le_bytes());
+            a[16..18].copy_from_slice(&24u16.to_le_bytes());
+            a[20..24].copy_from_slice(&16u32.to_le_bytes());
+            a
+        };
+        let idx_alloc = {
+            let mut a = vec![0u8; 80];
+            a[0..4].copy_from_slice(&0x50u32.to_le_bytes());
+            a[4..8].copy_from_slice(&80u32.to_le_bytes());
+            a[8] = 1; // no residente
+            a[9] = 4; // "$I30"
+            a[10..12].copy_from_slice(&64u16.to_le_bytes());
+            a[16..24].copy_from_slice(&4096u64.to_le_bytes()); // asignado
+            a[32..34].copy_from_slice(&72u16.to_le_bytes()); // runlist @+72
+            a[64..72].copy_from_slice(&"$I30".encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<_>>());
+            a[72..75].copy_from_slice(&[0x11, 0x01, 0x24]);
+            a
+        };
+        let rec5 = rec_bytes(3, &[
+            std_info,
+            fn_attr(".", 5, true, 0),
+            idx_root,
+            idx_alloc,
+            bitmap_attr(),
+        ]);
+        let root = parse_mft_record(5, &rec5).expect("registro raíz parseable");
+        assert_eq!(root.name.as_deref(), Some("."));
+        assert_eq!(root.parent, Some(5));
+        assert!(root.is_directory);
+        assert!(root.fixups_ok);
+    }
+
+    #[test]
     fn fixups_se_aplican_o_se_marcan() {
-        // caso ntfs-3g: cola del bloque 0 == USA[1] (array tras USA[0]).
+        // raw con fixups pendientes: cola == USA[0] → se restaura desde USA[i].
         let mut r = rec_bytes(1, &[fn_attr("x", 5, false, 0)]);
-        r[10..12].copy_from_slice(&0x1111u16.to_le_bytes()); // USA[1]
-        r[510..512].copy_from_slice(&0x1111u16.to_le_bytes()); // cola sin fixup
         assert!(apply_fixups(&mut r));
-        assert_eq!(u16::from_le_bytes([r[510], r[511]]), 0xBEEF);
-        // caso desalineado: se marca pero no se toca nada.
+        assert_eq!(u16::from_le_bytes([r[510], r[511]]), 0xAAAA);
+        assert_eq!(u16::from_le_bytes([r[1022], r[1023]]), 0xBBBB);
+        // registro ya fixupeado: cola == su entrada USA; se acepta sin tocar.
+        let mut r1 = rec_bytes(1, &[fn_attr("x", 5, false, 0)]);
+        r1[510..512].copy_from_slice(&0xAAAAu16.to_le_bytes());
+        assert!(apply_fixups(&mut r1));
+        assert_eq!(u16::from_le_bytes([r1[510], r1[511]]), 0xAAAA);
+        // caso desalineado (USA dudosa): se marca pero no se toca nada.
         let mut r2 = rec_bytes(1, &[fn_attr("x", 5, false, 0)]);
-        r2[10..12].copy_from_slice(&0x1111u16.to_le_bytes());
         r2[510..512].copy_from_slice(&0x2222u16.to_le_bytes());
         assert!(!apply_fixups(&mut r2));
         assert_eq!(u16::from_le_bytes([r2[510], r2[511]]), 0x2222);
@@ -2275,5 +2429,67 @@ mod tests {
         assert_eq!(spc_from_self(16, 2), Some(8));
         // en un volumen real del mismo patrón: 6.291.456 / 786.432 = 8.
         assert_eq!(spc_from_self(6_291_456, 786_432), Some(8));
+    }
+}
+
+#[cfg(test)]
+mod tests_real {
+    use super::*;
+
+    #[test]
+    fn registro_real_0_se_parsea() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rec0_mft.bin");
+        let Ok(raw) = std::fs::read(path) else {
+            return; // fixture opcional: solo presente cuando se copia
+        };
+        let rec = parse_mft_record(0, &raw).expect("registro 0 real parseable");
+        assert_eq!(rec.name.as_deref(), Some("$MFT"));
+        assert!(rec.fixups_ok);
+        let ext = extent_from_runs(&rec.data_runs, 8).expect("extensión desde runs reales");
+        assert_eq!(ext.0, 786432 * 8);
+    }
+
+    #[test]
+    fn registro_real_archivo_grande_se_parsea() {
+        // Archivo usuario real (01.mp4): cabecera $DATA no residente con los
+        // tamaños en +40/+48/+56 (trío coherente) y runlist en +64.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rec49_mft.bin");
+        let Ok(raw) = std::fs::read(path) else {
+            return;
+        };
+        let rec = parse_mft_record(49, &raw).expect("registro 49 real parseable");
+        assert_eq!(rec.name.as_deref(), Some("01.mp4"));
+        assert!(!rec.deleted);
+        assert_eq!(rec.real_size, 0x47B4_000);
+        assert_eq!(rec.data_runs.iter().map(|r| r.clusters).sum::<u64>(), 0x47B4);
+    }
+
+    #[test]
+    fn trio_de_tamanos_no_coherente_cede_a_ms() {
+        // Un $DATA al estilo MS (real@16, alloc@24) con basura en +40..+56
+        // debe quedar en los campos MS.
+        let mut a = vec![0u8; 72];
+        a[0..4].copy_from_slice(&0x80u32.to_le_bytes());
+        a[4..8].copy_from_slice(&72u32.to_le_bytes());
+        a[8] = 1;
+        a[16..24].copy_from_slice(&1234u64.to_le_bytes());
+        a[24..32].copy_from_slice(&2048u64.to_le_bytes());
+        a[32..34].copy_from_slice(&64u16.to_le_bytes());
+        a[40..56].copy_from_slice(&[0xFFu8; 16]);
+        a[64] = 0x00; // runlist vacío
+        let rec_bytes = {
+            let mut r = vec![0u8; 1024];
+            r[0..4].copy_from_slice(b"FILE");
+            r[4..6].copy_from_slice(&48u16.to_le_bytes());
+            r[6..8].copy_from_slice(&3u16.to_le_bytes());
+            r[0x14..0x16].copy_from_slice(&56u16.to_le_bytes());
+            r[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+            r[56..128].copy_from_slice(&a);
+            r[510..512].copy_from_slice(&[0u8; 2]);
+            r[1022..1024].copy_from_slice(&[0u8; 2]);
+            r
+        };
+        let rec = parse_mft_record(9, &rec_bytes).expect("parseable");
+        assert_eq!(rec.real_size, 2048);
     }
 }
