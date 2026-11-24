@@ -6,6 +6,31 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Added
+
+- `fs`: capa lógica de solo lectura sobre una imagen o medio (o sobre una
+  de sus particiones con `--partition N`). `regrow fs status` informa de
+  firmas y tablas MBR/GPT (CRC del header y del array, con su backup), de
+  la geometría y estructuras críticas de NTFS (`$MFT`, `$MFTMirr`, arranque
+  de respaldo) y FAT32, y del estado —terminado, pendiente o agotado— de
+  cada estructura según `--map`, leído del mapa y nunca deducido de
+  intentos de lectura. Con el BPB NTFS ilegible, la geometría puede
+  derivarse del espejo `$MFT`/`$MFTMirr`.
+- `regrow fs ls <imagen> [--path RUTA]`: listado de directorios y ficheros
+  leído de la `$MFT` sin montar nada. Cada entrada lleva su estado según el
+  mapa y las marcas `[borrado]` (registro con marca de borrado; se reporta,
+  no se recupera) y `[fixups dudosos]`. Un registro herido solo pierde ese
+  registro: el recorrido sigue. Memoria acotada con `--max-entries`.
+- `regrow fs report <imagen> --map M [--out F]`: informe JSONL con un
+  registro por tramo pendiente: tramo, estado y los registros MFT y
+  ficheros que lo tocan (referencia, nombre, ruta, tipo), más resumen.
+- `maps dfxml <map> --out F.xml [--source ETIQUETA]`: evidencia forense en
+  DFXML — un `byte_run` por tramo contiguo (offsets y longitudes en bytes,
+  estado `finished`/`pending`/`exhausted`, huecos como pendientes), tamaño
+  de sector y huella CRC32 del mapa. Legible por herramientas forenses
+  externas; ningún orden de `maps` toca discos ni imágenes.
+- Menú interactivo: opción `f` — fs status sobre el destino activo.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added
