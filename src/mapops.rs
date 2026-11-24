@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::mapfile::{MapFile, MapStatus};
+use crate::mapfile::{crc32, MapFile, MapStatus};
 
 const SECTOR_BYTES: u64 = crate::source::SECTOR_SIZE as u64;
 
@@ -627,6 +627,10 @@ fn maps_usage() -> ExitCode {
          \x20     convertir un mapfile de texto (ddrescue o exportación propia) a binario;\n\
          \x20     sin --domain se usa el dominio mínimo sugerido por el propio texto\n\
          \x20 export <map> --out <archivo-texto>   exportar al formato de texto de ddrescue\n\
+         \x20 dfxml <map> --out <archivo.xml> [--source ETIQUETA]\n\
+         \x20     exportar evidencia forense DFXML: un byte_run por tramo (offsets en\n\
+         \x20     bytes, estado finished/pending/exhausted, huecos como pendientes) más\n\
+         \x20     tamaño de sector y huella CRC32 del mapa\n\
          Ningún orden toca discos ni imágenes: operan solo sobre mapfiles."
     );
     ExitCode::from(2)
@@ -669,6 +673,76 @@ fn same_path(a: &Path, b: &Path) -> bool {
     let ra = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
     let rb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
     ra == rb
+}
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("&#{};", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// DFXML (Digital Forensics XML) derivado del mapfile: un `byte_run` por cada
+/// tramo contiguo del dominio — los rangos del mapa con su estado y los
+/// huecos como pendientes. Los offsets y longitudes van en bytes. Tokens de
+/// estado en inglés (finished/pending/exhausted) para que los consuman
+/// herramientas forenses externas. Jamás toca el mapfile.
+pub fn dfxml_document(m: &MapFile, source_label: &str) -> String {
+    let map_crc = crc32(&m.serialize());
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<dfxml xmlns=\"https://www.dcilab.org/xmlns/dfxml\">\n");
+    out.push_str("  <fileobject>\n");
+    out.push_str(&format!("    <filename>{}</filename>\n", xml_escape(source_label)));
+    out.push_str(&format!(
+        "    <filesize>{}</filesize>\n",
+        m.sector_count.saturating_mul(crate::source::SECTOR_SIZE as u64)
+    ));
+    out.push_str("    <byte_runs>\n");
+    let mut pos = 0u64;
+    for e in m.entries() {
+        if e.start > pos {
+            out.push_str(&dfxml_run(pos, e.start - pos, "pending"));
+        }
+        let st = match e.status {
+            MapStatus::Good => "finished",
+            MapStatus::Failed => "pending",
+            MapStatus::Scraped => "exhausted",
+        };
+        out.push_str(&dfxml_run(e.start, e.len, st));
+        pos = e.start.saturating_add(e.len);
+    }
+    if pos < m.sector_count {
+        out.push_str(&dfxml_run(pos, m.sector_count - pos, "pending"));
+    }
+    out.push_str("    </byte_runs>\n  </fileobject>\n");
+    out.push_str("  <processing>\n");
+    out.push_str(&format!(
+        "    <machine>regrow {}</machine>\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    out.push_str("    <sector_size>512</sector_size>\n");
+    out.push_str(&format!("    <mapfile_crc32>{map_crc:08x}</mapfile_crc32>\n"));
+    out.push_str("  </processing>\n</dfxml>\n");
+    out
+}
+
+fn dfxml_run(start: u64, len: u64, status: &str) -> String {
+    format!(
+        "      <byte_run offset=\"{}\" length=\"{}\" status=\"{}\"/>\n",
+        start.saturating_mul(crate::source::SECTOR_SIZE as u64),
+        len.saturating_mul(crate::source::SECTOR_SIZE as u64),
+        status
+    )
 }
 
 pub fn cli_maps(args: &[String]) -> ExitCode {
@@ -1046,6 +1120,44 @@ pub fn cli_maps(args: &[String]) -> ExitCode {
                         areas.len(),
                         areas.iter().filter(|a| a.2 == MapStatus::Failed).count(),
                         areas.iter().filter(|a| a.2 == MapStatus::Scraped).count(),
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => err(format!("no se puede escribir {}: {e}", out.display())),
+            }
+        }
+        "dfxml" => {
+            let Some(path) = args.get(1) else { return maps_usage() };
+            let mut out: Option<PathBuf> = None;
+            let mut source: Option<String> = None;
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--out" => out = take_out(args, &mut i),
+                    "--source" => {
+                        let Some(v) = args.get(i + 1) else { return maps_usage() };
+                        source = Some(v.clone());
+                        i += 1;
+                    }
+                    _ => return err(format!("opción no reconocida '{}'", args[i])),
+                }
+                i += 1;
+            }
+            let Some(out) = out else {
+                return err("dfxml necesita --out <archivo.xml>".into());
+            };
+            let m = match MapFile::load(Path::new(path)) {
+                Ok(m) => m,
+                Err(e) => return err(e),
+            };
+            let label = source.unwrap_or_else(|| path.to_string());
+            match write_text_atomic(&out, &dfxml_document(&m, &label)) {
+                Ok(()) => {
+                    println!(
+                        "DFXML escrito en {} — {} sectores de evidencia ({} rangos del mapa + huecos)",
+                        out.display(),
+                        m.sector_count,
+                        m.entries().len()
                     );
                     ExitCode::SUCCESS
                 }
@@ -1532,5 +1644,35 @@ mod tests {
         let back = MapFile::load(&bin).unwrap();
         assert_eq!(back.stats().0, m.stats().0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dfxml_golden() {
+        let mut m = MapFile::new(100);
+        m.set(0, 10, MapStatus::Good, 0);
+        m.set(20, 10, MapStatus::Scraped, 3);
+        m.set(40, 10, MapStatus::Failed, 0);
+        let doc = dfxml_document(&m, "disco.img");
+        let expected_runs = [
+            "      <byte_run offset=\"0\" length=\"5120\" status=\"finished\"/>",
+            "      <byte_run offset=\"5120\" length=\"5120\" status=\"pending\"/>",
+            "      <byte_run offset=\"10240\" length=\"5120\" status=\"exhausted\"/>",
+            "      <byte_run offset=\"15360\" length=\"5120\" status=\"pending\"/>",
+            "      <byte_run offset=\"20480\" length=\"5120\" status=\"pending\"/>",
+            "      <byte_run offset=\"25600\" length=\"25600\" status=\"pending\"/>",
+        ];
+        for line in expected_runs {
+            assert!(doc.contains(line), "falta «{line}» en:\n{doc}");
+        }
+        assert_eq!(doc.matches("<byte_run ").count(), 6);
+        assert!(doc.contains("<filesize>51200</filesize>"));
+        assert!(doc.contains("<sector_size>512</sector_size>"));
+        assert!(doc.contains("<filename>disco.img</filename>"));
+        assert!(doc.contains("<mapfile_crc32>"));
+        // determinista: dos llamadas, mismo documento
+        assert_eq!(doc, dfxml_document(&m, "disco.img"));
+        // escapeo de etiquetas hostiles
+        let raro = dfxml_document(&m, "a&b<img>");
+        assert!(raro.contains("<filename>a&amp;b&lt;img&gt;</filename>"));
     }
 }

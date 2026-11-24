@@ -256,7 +256,7 @@ impl MapFile {
 
     // ------------------------------------------------ persistente binario ----
 
-    fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Vec<u8> {
         let mut b: Vec<u8> = Vec::with_capacity(24 + self.entries.len() * ENTRY_BYTES + 4);
         b.extend_from_slice(MAP_MAGIC);
         b.extend_from_slice(&MAP_VERSION.to_le_bytes());
