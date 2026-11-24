@@ -9,7 +9,9 @@
 #
 # Requisitos opcionales (quien no los tenga simplemente no genera ese binario):
 #   brew install mingw-w64
-#   brew install FiloSottile/musl-cross/musl-cross
+#   brew install FiloSottile/musl-cross/musl-cross   (o, en su lugar:
+#   brew install zig && cargo install cargo-zigbuild — enlaza el mismo
+#   binario estático musl sin construir una toolchain cruzada desde fuente)
 #
 # Uso: scripts/dist.sh [--with-arm64]   (el flag añade regrow-macos-arm64 nativo)
 set -euo pipefail
@@ -27,12 +29,18 @@ if [[ "${1:-}" == "--with-arm64" ]]; then
     cp build/aarch64-apple-darwin/release/regrow "$out/regrow-macos-arm64"
 fi
 
-# Linux estático con musl (sin atarse a la glibc de la máquina de build)
+# Linux estático con musl (sin atarse a la glibc de la máquina de build).
+# Vía clásica: musl-cross. Alternativa equivalente: cargo-zigbuild (zig trae
+# el enlazador cruzado y musl ya construidos).
 if command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
     cargo build --release --target x86_64-unknown-linux-musl
     cp build/x86_64-unknown-linux-musl/release/regrow "$out/regrow-linux"
+elif command -v cargo-zigbuild >/dev/null 2>&1; then
+    cargo zigbuild --release --target x86_64-unknown-linux-musl
+    cp build/x86_64-unknown-linux-musl/release/regrow "$out/regrow-linux"
 else
-    echo "aviso: sin musl-cross (brew install FiloSottile/musl-cross/musl-cross); no se genera regrow-linux" >&2
+    echo "aviso: sin musl-cross ni cargo-zigbuild; no se genera regrow-linux" >&2
+    echo "       (brew install FiloSottile/musl-cross/musl-cross, o brew install zig && cargo install cargo-zigbuild)" >&2
 fi
 
 # Windows vía mingw-w64
