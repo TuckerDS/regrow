@@ -1205,20 +1205,29 @@ fn parse_fs_args(rest: &[String]) -> Result<FsArgs, String> {
     let mut i = 0usize;
     while i < rest.len() {
         let flag = rest[i].as_str();
-        let take = |name: &str| -> Result<String, String> {
-            rest
-                .get(i + 1)
-                .cloned()
-                .ok_or_else(|| format!("falta valor para {name}"))
+        // consume el valor del flag: avanza i sobre él (como los CLI del motor)
+        let mut next = |name: &str| -> Result<String, String> {
+            if i + 1 < rest.len() {
+                i += 1;
+                Ok(rest[i].clone())
+            } else {
+                Err(format!("falta valor para {name}"))
+            }
         };
         match flag {
-            "--map" => a.map = Some(PathBuf::from(take("--map")?)),
-            "--dev" => a.dev = Some(take("--dev")?),
-            "--raw" => a.raw = Some(take("--raw")?.parse().map_err(|_| "--raw necesita un número de medio".to_string())?),
-            "--partition" => a.partition = Some(take("--partition")?.parse().map_err(|_| "--partition necesita un número".to_string())?),
-            "--path" => a.path = take("--path")?,
-            "--out" => a.out = Some(PathBuf::from(take("--out")?)),
-            "--max-entries" => a.max_entries = take("--max-entries")?.parse().map_err(|_| "--max-entries necesita un número".to_string())?,
+            "--map" => a.map = Some(PathBuf::from(next("--map")?)),
+            "--dev" => a.dev = Some(next("--dev")?),
+            "--raw" => {
+                a.raw = Some(next("--raw")?.parse().map_err(|_| "--raw necesita un número de medio".to_string())?)
+            }
+            "--partition" => {
+                a.partition = Some(next("--partition")?.parse().map_err(|_| "--partition necesita un número".to_string())?)
+            }
+            "--path" => a.path = next("--path")?,
+            "--out" => a.out = Some(PathBuf::from(next("--out")?)),
+            "--max-entries" => {
+                a.max_entries = next("--max-entries")?.parse().map_err(|_| "--max-entries necesita un número".to_string())?
+            }
             _ if flag.starts_with('-') => return Err(format!("flag desconocido: {flag}")),
             _ => {
                 if a.image.is_some() {
@@ -1297,7 +1306,16 @@ fn cmd_status(a: &FsArgs) -> ExitCode {
         Some(b) => b,
         None => return fs_err("no se pudo leer el sector 0".into()),
     };
-    let mbr = Mbr::parse(&s0);
+    let mbr = if detect_boot(&s0) == BootKind::Unknown {
+        Mbr::parse(&s0)
+    } else {
+        // El sector 0 ya es un BPB (partición suelta, el caso del campo):
+        // los bytes 446.. son código de arranque, no tabla de particiones.
+        if a.partition.is_some() {
+            return fs_err("el dominio es una partición suelta (firma de FS en el sector 0): no hay tabla de particiones que seleccionar".into());
+        }
+        None
+    };
     let mut base = 0u64;
     let mut base_note = String::from("sector 0 del dominio");
     let mut gpt_shown = false;
@@ -2236,8 +2254,24 @@ mod tests {
     }
 
     #[test]
-    fn spc_derivable_del_propio_record() {
-        // $MFT física en el sector 16, su run dice lcn 2 → spc 8.
+    fn parse_args_flags_consumen_valores() {
+        let s = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<String>>();
+        let a = parse_fs_args(&s(&[
+            "img.raw", "--map", "m.map", "--partition", "2", "--path", "/datos", "--max-entries", "500",
+        ]))
+        .expect("flags con valores deben consumir su valor");
+        assert_eq!(a.image.as_deref(), Some("img.raw"));
+        assert_eq!(a.map, Some(PathBuf::from("m.map")));
+        assert_eq!(a.partition, Some(2));
+        assert_eq!(a.path, "/datos");
+        assert_eq!(a.max_entries, 500);
+        assert!(parse_fs_args(&s(&["x", "--map"])).is_err());
+        assert!(parse_fs_args(&s(&["x", "--nope"])).is_err());
+        assert!(parse_fs_args(&s(&["x", "y"])).is_err());
+    }
+
+    #[test]
+    fn spc_derivable_del_propio_record() {        // $MFT física en el sector 16, su run dice lcn 2 → spc 8.
         assert_eq!(spc_from_self(16, 2), Some(8));
         // en un volumen real del mismo patrón: 6.291.456 / 786.432 = 8.
         assert_eq!(spc_from_self(6_291_456, 786_432), Some(8));
