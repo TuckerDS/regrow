@@ -137,11 +137,12 @@ fn usage() -> ! {
          \x20                    contrastea lo escrito; --resume reanuda por el mapa.\n\
          \x20 regrow rescue <imagen-destino> --raw N | --dev PATH [opciones]\n\
          \x20 regrow surfmap --id N [--log-dir D] [--sectors N] [--cells N] [--out F]\n\
-         \x20 regrow maps <status|done|diff|merge|invert|complete|retype|shift|list|from-list|import|export>\n\
+         \x20 regrow maps <status|done|diff|merge|invert|complete|retype|shift|annotate|list|from-list|import|export>\n\
          \x20                    operaciones entre mapfiles que nunca tocan discos ni imágenes:\n\
          \x20                    fusionar lo terminado de dos pasadas (--mode or|and|xor),\n\
          \x20                    contrastar mapas (diff; sale 1 si difieren), resumen (status),\n\
-         \x20                    test de rescate completo (done; sale 0 si está todo), y\n\
+         \x20                    test de rescate completo (done; sale 0 si está todo),\n\
+         \x20                    anotar un mapa como texto comentado (annotate), y\n\
          \x20                    importar/exportar listas estilo badblocks y bitmaps.\n\
          \x20                    `regrow maps` a secas describe cada orden.\n\
          \x20 regrow menu [imagen|--raw N|--dev PATH] [opciones]\n\

@@ -17,6 +17,14 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
   bitmap 1 bit/sector, BE/LE), `from-list` (crear un mapa desde una lista
   badblocks o un bitmap), e `import`/`export` de mapfiles de texto
   compatibles con ddrescue. Ningún orden escribe sobre medios.
+- `maps annotate <map> --out <archivo>`: copia anotada del mapa — texto con
+  cabecera de totales y *áreas de daño*, y una línea por tramo con estado,
+  tamaño legible, porcentaje, área y reintentos. Las líneas conservan el
+  formato de mapfile de texto (sigue siendo importable por ddrescue y por
+  el propio regrow). Nunca reescribe su propia entrada y escribe de forma
+  atómica.
+- `maps status` incluye el recuento de áreas de daño (corridas contiguas del
+  mismo estado pendiente, huecos sin mapear incluidos).
 
 ## [0.3.0] - 2026-11-21
 

@@ -45,6 +45,27 @@ fn coverage(m: &MapFile) -> Vec<(u64, u64, MapStatus)> {
 
 // ------------------------------------------------------------- utilidades ----
 
+/// Áreas de daño: corridas contiguas de sectores no terminados agrupadas por
+/// **estado** (decisión D-A1 de la spec 001: un `?` contiguo a un `-` forman
+/// dos áreas distintas; lo mismo contiguo se fusiona). Los huecos sin mapear
+/// valen por `-`. Ordenadas por posición; su índice +1 es el id del área.
+pub fn damage_areas(m: &MapFile) -> Vec<(u64, u64, MapStatus)> {
+    let mut out: Vec<(u64, u64, MapStatus)> = Vec::new();
+    for (s, l, st) in coverage(m) {
+        if st == MapStatus::Good {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            if last.2 == st && last.0 + last.1 == s {
+                last.1 += l;
+                continue;
+            }
+        }
+        out.push((s, l, st));
+    }
+    out
+}
+
 fn gib_of(sectors: u64) -> String {
     format!("{:.2} GiB", (sectors as f64) * SECTOR_BYTES as f64 / (1024.0 * 1024.0 * 1024.0))
 }
@@ -60,6 +81,9 @@ fn pct(part: u64, total: u64) -> f64 {
 /// Resumen humano del mapa: conteos por estado con porcentaje y tamaño.
 pub fn summary_lines(m: &MapFile) -> Vec<String> {
     let (good, failed, scraped, untried) = m.stats();
+    let areas = damage_areas(m);
+    let a_scraped = areas.iter().filter(|a| a.2 == MapStatus::Scraped).count();
+    let a_failed = areas.len() - a_scraped;
     vec![
         format!(
             "dominio: {} sectores = {} · {} rangos",
@@ -75,6 +99,12 @@ pub fn summary_lines(m: &MapFile) -> Vec<String> {
             untried
         ),
         format!("  ? agotados   : {:>12} ({:6.2} %)", scraped, pct(scraped, m.sector_count)),
+        format!(
+            "  áreas de daño: {:>12} (pendientes {} · agotadas {})",
+            areas.len(),
+            a_failed,
+            a_scraped
+        ),
     ]
 }
 
@@ -267,6 +297,122 @@ pub fn shift(m: &MapFile, delta: i64) -> MapFile {
         }
     }
     out
+}
+
+// --------------------------------------------------------------- annotate ----
+
+/// Tamaño humano de un número de sectores (512 B).
+fn human_of(sectors: u64) -> String {
+    const K: u64 = 1024;
+    let b = sectors * SECTOR_BYTES;
+    if b < K {
+        format!("{b} B")
+    } else if b < K * K {
+        format!("{:.1} KiB", b as f64 / K as f64)
+    } else if b < K * K * K {
+        format!("{:.1} MiB", b as f64 / (K * K) as f64)
+    } else {
+        format!("{:.2} GiB", b as f64 / (K * K * K) as f64)
+    }
+}
+
+/// Como `coverage`, pero distinguiendo rangos explícitos (`Some(reintentos)`)
+/// de huecos sin mapear (`None`), para anotar unos y otros por separado.
+fn coverage_detailed(m: &MapFile) -> Vec<(u64, u64, MapStatus, Option<u8>)> {
+    let mut out = Vec::with_capacity(m.entries().len() + 1);
+    let mut pos = 0u64;
+    for e in m.entries() {
+        if e.start > pos {
+            out.push((pos, e.start - pos, MapStatus::Failed, None));
+        }
+        out.push((e.start, e.len, e.status, Some(e.retries)));
+        pos = e.start + e.len;
+    }
+    if pos < m.sector_count {
+        out.push((pos, m.sector_count - pos, MapStatus::Failed, None));
+    }
+    out
+}
+
+/// Anotación legible por humanos del mapfile (spec 001): cabecera con
+/// totales y áreas de daño, y una línea por tramo con las mismas columnas
+/// que `export_text` — de modo que el archivo anotado sigue siendo un
+/// mapfile de texto válido para ddrescue y para `maps import` (los
+/// comentarios se ignoran al importar). `now` entra ya formateada y
+/// inyectada: el cuerpo es determinista.
+pub fn annotate_text(m: &MapFile, now: &str) -> String {
+    let (good, failed, scraped, untried) = m.stats();
+    let total = m.sector_count;
+    let areas = damage_areas(m);
+    let a_scraped = areas.iter().filter(|a| a.2 == MapStatus::Scraped).count();
+    let a_failed = areas.len() - a_scraped;
+    let mut s = String::new();
+    s.push_str(&format!(
+        "# Mapfile anotado por regrow — {now} (copia de lectura; el maestro no se toca)\n"
+    ));
+    s.push_str(&format!(
+        "# Dominio: {total} sectores = {} · {} rangos\n",
+        gib_of(total),
+        m.entries().len()
+    ));
+    s.push_str(&format!(
+        "#   + terminados: {good} ({:.2} %) · - pendientes: {} · ? agotados: {scraped} ({:.2} %)\n",
+        pct(good, total),
+        failed + untried,
+        pct(scraped, total)
+    ));
+    s.push_str(&format!(
+        "#   áreas de daño: {} (pendientes {a_failed} · agotadas {a_scraped}){}\n",
+        areas.len(),
+        if areas.is_empty() {
+            " — rescate terminado"
+        } else {
+            ""
+        }
+    ));
+    s.push_str("#      pos        size  status\n");
+    let mut ai = 0usize;
+    for (start, len, st, retries) in coverage_detailed(m) {
+        // El cursor de áreas avanza monótonamente con la posición (ambas
+        // listas se construyen en el mismo orden).
+        let area_id: Option<usize> = if st == MapStatus::Good || areas.is_empty() {
+            None
+        } else {
+            while ai + 1 < areas.len() && areas[ai].0 + areas[ai].1 <= start {
+                ai += 1;
+            }
+            if areas[ai].0 <= start && start < areas[ai].0 + areas[ai].1 {
+                Some(ai + 1)
+            } else {
+                None
+            }
+        };
+        let label = match st {
+            MapStatus::Good => "terminado",
+            MapStatus::Scraped => "agotado",
+            MapStatus::Failed if retries.is_some() => "pendiente",
+            MapStatus::Failed => "sin mapear",
+        };
+        let mut line = format!(
+            "0x{:08x}  0x{:08x}  {}   # {label} · {} ({:.2} %)",
+            start * SECTOR_BYTES,
+            len * SECTOR_BYTES,
+            st.char(),
+            human_of(len),
+            pct(len, total),
+        );
+        if let Some(n) = area_id {
+            line.push_str(&format!(" · área {n}"));
+        }
+        if let Some(r) = retries {
+            if r > 0 {
+                line.push_str(&format!(" · reintentos {r}"));
+            }
+        }
+        s.push_str(&line);
+        s.push('\n');
+    }
+    s
 }
 
 // ------------------------------------------------- listas y bitmaps externo --
@@ -462,8 +608,11 @@ pub fn min_domain_from_text(text: &str) -> Option<u64> {
 fn maps_usage() -> ExitCode {
     eprintln!(
         "uso: regrow maps <orden> [mapfiles] [opciones]\n\
-         \x20 status <map>                     resumen por estado (conteos, %, tamaños)\n\
+         \x20 status <map>                     resumen por estado (conteos, %, tamaños, áreas de daño)\n\
          \x20 done <map>                       sale 0 si el dominio está enteramente terminado\n\
+         \x20 annotate <map> --out <archivo>   copia de texto comentada (cabecera con totales y\n\
+         \x20     áreas; líneas legibles por humanos que siguen siendo mapfile de texto válido;\n\
+         \x20     jamás reescribe la entrada)\n\
          \x20 diff <mapA> <mapB> [--finished-only]   contrastar; sale 0 si iguales, 1 si difieren\n\
          \x20 merge --mode <or|and|xor> <mapA> <mapB> […] --out <map>   fusionar lo terminado\n\
          \x20 invert <map> --out <map>         lo terminado ↔ lo pendiente\n\
@@ -495,6 +644,31 @@ fn take_out(args: &[String], i: &mut usize) -> Option<PathBuf> {
 fn err(msg: String) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::from(2)
+}
+
+/// Escritura atómica de un archivo de texto derivado: temporal en el mismo
+/// directorio + `fsync` + rename, el mismo patrón del mapfile binario. Un
+/// corte jamás deja un anotado a medias ni un `.tmp` engañoso.
+fn write_text_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(&tmp_os);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// ¿Dos rutas refieren al mismo archivo? (para rechazar operaciones in situ).
+fn same_path(a: &Path, b: &Path) -> bool {
+    let ra = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let rb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    ra == rb
 }
 
 pub fn cli_maps(args: &[String]) -> ExitCode {
@@ -835,6 +1009,49 @@ pub fn cli_maps(args: &[String]) -> ExitCode {
                 Err(e) => err(format!("no se puede escribir {}: {e}", out.display())),
             }
         }
+        "annotate" => {
+            let Some(path) = args.get(1) else { return maps_usage() };
+            let mut out: Option<PathBuf> = None;
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--out" => out = take_out(args, &mut i),
+                    _ => return err(format!("opción no reconocida '{}'", args[i])),
+                }
+                i += 1;
+            }
+            let Some(out) = out else {
+                return err("annotate necesita --out <archivo> (nunca reescribe la entrada)".into());
+            };
+            let inp = Path::new(path);
+            if same_path(inp, &out) {
+                return err("annotate no escribe sobre su propia entrada: usa --out distinto".into());
+            }
+            let m = match MapFile::load(inp) {
+                Ok(m) => m,
+                Err(e) => return err(e),
+            };
+            let now = crate::log::format_asctime_utc(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            );
+            match write_text_atomic(&out, &annotate_text(&m, &now)) {
+                Ok(()) => {
+                    let areas = damage_areas(&m);
+                    println!(
+                        "anotación escrita en {} — {} áreas de daño (pendientes {}, agotadas {})",
+                        out.display(),
+                        areas.len(),
+                        areas.iter().filter(|a| a.2 == MapStatus::Failed).count(),
+                        areas.iter().filter(|a| a.2 == MapStatus::Scraped).count(),
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => err(format!("no se puede escribir {}: {e}", out.display())),
+            }
+        }
         "import" => {
             let Some(path) = args.get(1) else { return maps_usage() };
             let mut domain = 0u64;
@@ -1136,8 +1353,152 @@ mod tests {
     }
 
     #[test]
-    fn importar_y_exportar_mapas_de_texto() {
-        let dir = tmpdir("text");
+    fn areas_se_agrupan_por_estado_no_terminado() {
+        // D-A1: un `?` contiguo a un `-` forma DOS áreas; lo mismo contiguo se fusiona.
+        let m = mapa(
+            100,
+            &[
+                (10, 5, MapStatus::Good),
+                (15, 10, MapStatus::Scraped),
+                (25, 5, MapStatus::Failed),
+                (30, 10, MapStatus::Failed), // mismo estado contiguo ⇒ sigue la misma área
+                (40, 1, MapStatus::Good),
+            ],
+        );
+        assert_eq!(
+            damage_areas(&m),
+            vec![
+                (0, 10, MapStatus::Failed),  // hueco inicial
+                (15, 10, MapStatus::Scraped),
+                (25, 15, MapStatus::Failed),
+                (41, 59, MapStatus::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn areas_huecos_y_mapas_extremos() {
+        // Huecos sin mapear valen por `-`.
+        let m = mapa(50, &[(10, 5, MapStatus::Good), (20, 3, MapStatus::Scraped)]);
+        assert_eq!(
+            damage_areas(&m),
+            vec![
+                (0, 10, MapStatus::Failed),
+                (15, 5, MapStatus::Failed),
+                (20, 3, MapStatus::Scraped),
+                (23, 27, MapStatus::Failed),
+            ]
+        );
+        // Mapa sin rangos: todo el dominio es una sola área pendiente.
+        assert_eq!(damage_areas(&mapa(30, &[])), vec![(0, 30, MapStatus::Failed)]);
+        // Mapa completo: cero áreas.
+        assert!(damage_areas(&mapa(100, &[(0, 100, MapStatus::Good)])).is_empty());
+    }
+
+    #[test]
+    fn status_incluye_areas_de_dano() {
+        let m = mapa(100, &[(10, 5, MapStatus::Good), (15, 10, MapStatus::Scraped)]);
+        let lines = summary_lines(&m);
+        let areas = lines.iter().find(|l| l.contains("áreas de daño"));
+        assert!(areas.is_some(), "{lines:?}");
+        // 3 áreas: hueco inicial (-), agotado (?), hueco final (-).
+        assert!(areas.unwrap().contains("3"), "{areas:?}");
+    }
+
+    #[test]
+    fn annotate_golden_completo() {
+        let mut m = MapFile::new(50);
+        m.set(10, 5, MapStatus::Good, 0);
+        m.set(20, 3, MapStatus::Scraped, 2);
+        m.set(30, 4, MapStatus::Failed, 1);
+        let text = annotate_text(&m, "2026-11-24 12:00:00 UTC");
+        let expected = "\
+# Mapfile anotado por regrow — 2026-11-24 12:00:00 UTC (copia de lectura; el maestro no se toca)
+# Dominio: 50 sectores = 0.00 GiB · 3 rangos
+#   + terminados: 5 (10.00 %) · - pendientes: 42 · ? agotados: 3 (6.00 %)
+#   áreas de daño: 4 (pendientes 3 · agotadas 1)
+#      pos        size  status
+0x00000000  0x00001400  -   # sin mapear · 5.0 KiB (20.00 %) · área 1
+0x00001400  0x00000a00  +   # terminado · 2.5 KiB (10.00 %)
+0x00001e00  0x00000a00  -   # sin mapear · 2.5 KiB (10.00 %) · área 2
+0x00002800  0x00000600  ?   # agotado · 1.5 KiB (6.00 %) · área 3 · reintentos 2
+0x00002e00  0x00000e00  -   # sin mapear · 3.5 KiB (14.00 %) · área 4
+0x00003c00  0x00000800  -   # pendiente · 2.0 KiB (8.00 %) · área 4 · reintentos 1
+0x00004400  0x00002000  -   # sin mapear · 8.0 KiB (32.00 %) · área 4
+";
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn annotate_mapa_completo_y_reparsing_del_anotado() {
+        let done = mapa(100, &[(0, 100, MapStatus::Good)]);
+        let text = annotate_text(&done, "2026-11-24 12:00:00 UTC");
+        assert!(text.contains("rescate terminado"), "{text}");
+        assert!(text.contains("áreas de daño: 0"), "{text}");
+
+        // El cuerpo anotado sigue siendo un mapfile de texto válido: los
+        // importadores ignoran los comentarios y recuperan el mismo conjunto.
+        let dir = tmpdir("annot_rep");
+        let mut m = MapFile::new(50);
+        m.set(10, 5, MapStatus::Good, 0);
+        m.set(20, 3, MapStatus::Scraped, 2);
+        let p = dir.join("anotado.txt");
+        fs::write(&p, annotate_text(&m, "2026-11-24 12:00:00 UTC").as_bytes()).unwrap();
+        let back = MapFile::import_text(&p, 50).unwrap();
+        assert_eq!(back.stats().0, m.stats().0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn annotate_cli_escribe_atachado_y_rechaza_in_situ() {
+        let dir = tmpdir("annot_cli");
+        let mut m = MapFile::new(50);
+        m.set(10, 5, MapStatus::Good, 0);
+        m.set(20, 3, MapStatus::Scraped, 2);
+        let inp = dir.join("maestro.map");
+        m.save(&inp).unwrap();
+
+        // Rechazo total sin `--out` y rechazo escribir sobre la propia entrada.
+        assert_ne!(
+            cli_maps(&["annotate".into(), inp.display().to_string()]),
+            ExitCode::SUCCESS
+        );
+        assert_ne!(
+            cli_maps(&[
+                "annotate".into(),
+                inp.display().to_string(),
+                "--out".into(),
+                inp.display().to_string()
+            ]),
+            ExitCode::SUCCESS,
+            "annotate jamás reescribe la entrada (RF-3)"
+        );
+        assert!(MapFile::load(&inp).is_ok(), "el maestro debe quedar intacto");
+
+        // Salida normal: archivo atómico sin .tmp residual y re-importable.
+        let outp = dir.join("maestro.anotado.txt");
+        let code = cli_maps(&[
+            "annotate".into(),
+            inp.display().to_string(),
+            "--out".into(),
+            outp.display().to_string(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let residuos: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|f| f.ends_with(".tmp"))
+            .collect();
+        assert!(residuos.is_empty(), "quedó tmp: {residuos:?}");
+        let text = fs::read_to_string(&outp).unwrap();
+        assert!(text.contains("áreas de daño"), "{text}");
+        let back = MapFile::import_text(&outp, 50).unwrap();
+        assert_eq!(back.stats().0, m.stats().0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn importar_y_exportar_mapas_de_texto() {        let dir = tmpdir("text");
         // Mapfile de texto al estilo ddrescue: posiciones en bytes, leyenda 1.23+.
         let txt = dir.join("mapa.map.txt");
         fs::write(
