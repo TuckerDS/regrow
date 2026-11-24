@@ -6,6 +6,8 @@ y el versionado sigue [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
 ### Added
 
 - `maps`: operaciones entre mapfiles que nunca tocan discos ni imágenes.
